@@ -1,5 +1,11 @@
+# 构建前端通过 setuptools 后端生成包；requires 声明构建环境所需依赖，
+# 包括编译工具和 torch，不等同于安装 vLLM 时的完整运行依赖。
 [build-system]
 # Should be mirrored in requirements/build/cuda.txt
+# cmake/ninja 支持本地扩展构建；packaging 提供版本与平台标记等处理能力。
+# setuptools 是打包后端，scm 扩展提供版本信息，rust 扩展支持 Rust 构建。
+# torch 在这里被固定为精确版本；修改它需要结合本地扩展构建兼容性检查。
+# wheel 支持 wheel 打包，jinja2 提供模板渲染能力。
 requires = [
     "cmake>=3.26.1",
     "ninja",
@@ -13,6 +19,9 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+# Python 分发包的标准元数据，供安装器和包索引读取。
+# name 是分发包名；readme 提供项目长描述，description 提供简短摘要。
+# license 声明许可表达式，license-files 指定随分发包携带的许可文件。
 [project]
 name = "vllm"
 authors = [{name = "vLLM Team"}]
@@ -20,6 +29,8 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
+# classifiers 是包索引上的分类标签，不会强制检查解释器版本；
+# 下方 requires-python 才是安装器判断 Python 版本兼容性的约束。
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -33,32 +44,45 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 requires-python = ">=3.10,<3.15"
+# 这些元数据由构建后端动态提供；setup.py 中的 get_requirements()
+# 根据目标设备选择 requirements 下的依赖文件，extras_require 定义可选依赖。
 dynamic = [ "version", "dependencies", "optional-dependencies"]
 
+# 发布到包元数据中的相关链接；这里的 URL 不参与依赖下载或镜像选择。
 [project.urls]
 Homepage="https://github.com/vllm-project/vllm"
 Documentation="https://docs.vllm.ai/en/latest/"
 Slack="https://slack.vllm.ai/"
 
+# 安装后生成 vllm 命令，执行时调用指定模块的 main 函数。
 [project.scripts]
 vllm = "vllm.entrypoints.cli.main:main"
 
+# 插件入口声明供运行时发现注册函数；它们不是额外的命令行命令。
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
+# 空表也有意义：启用 setuptools-scm，使用版本控制信息推导版本。
+# 最终分发版本还应结合 setup.py 的 get_vllm_version() 阅读。
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
 
+# 从项目根目录发现名称匹配 vllm* 的 Python 包（包括子包）。
+# 这不是整个仓库文件的复制规则；扩展模块与资源文件还由构建脚本等控制。
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm*"]
 
+# 以下为开发工具配置：Ruff 的文件级豁免与全局规则共同决定检查范围。
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 
+# 上方 ALL 表示对应文件忽略所有规则，F401 表示忽略未使用导入。
+# select 按规则前缀启用检查：E 代码风格，F 静态错误，UP 新语法建议，
+# B 常见缺陷，ISC 隐式字符串拼接，SIM 简化建议，I 导入排序，G 日志格式。
 [tool.ruff.lint]
 select = [
     # pycodestyle
@@ -78,6 +102,9 @@ select = [
     # flake8-logging-format
     "G",
 ]
+# 从启用的规则中排除以下检查：星号导入及其名称解析、lambda 赋值、
+# zip 缺少 strict、未使用循环变量，以及建议将 format 调用改为 f-string。
+# 这些例外只影响检查报告，不改变 Python 代码的执行行为。
 ignore = [
     # star imports
     "F405", "F403",
@@ -91,15 +118,23 @@ ignore = [
     "UP032",
 ]
 
+# 运行 Ruff formatter 时也格式化其识别出的 docstring 内代码示例。
+# 这是格式化行为，和上面的 lint 规则选择分别配置。
 [tool.ruff.format]
 docstring-code-format = true
 
+# mypy 是静态类型检查器；这些配置不会在运行时增加参数校验。
 [tool.mypy]
+# 通过插件补充 Pydantic 模型等结构的类型信息。
 plugins = ['pydantic.mypy']
+# 忽略无法解析的导入所产生的缺失模块/类型信息报告。
 ignore_missing_imports = true
+# 即使函数未标注类型，也检查其函数体；不等于强制所有函数写类型注解。
 check_untyped_defs = true
+# 跟踪导入以获得类型信息，但抑制被跟踪模块内部的错误报告。
 follow_imports = "silent"
 
+# 注册测试标记及其含义；具体跳过或筛选行为还需查看测试钩子和运行参数。
 [tool.pytest.ini_options]
 markers = [
     "slow_test",
@@ -113,12 +148,17 @@ markers = [
     "optional: optional tests that are automatically skipped, include --optional to run them",
 ]
 
+# ty 是另一套类型检查工具，其配置与 mypy 相互独立。
+# 发现待检查源码时遵守 .gitignore 等忽略文件中的规则。
 [tool.ty.src]
 respect-ignore-files = true
 
+# 使用项目虚拟环境定位依赖和解释器相关信息，避免按其他环境解析导入。
 [tool.ty.environment]
 python = "./.venv"
 
+# typos 检查拼写，不检查类型或程序逻辑。
+# extend-exclude 在默认排除规则上追加路径，避免对测试语料、生成物等误报。
 [tool.typos.files]
 # these files may be written in non english words
 extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
@@ -132,11 +172,15 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*", "rust/src/parser/**",
     "rust/src/text/src/output/decoded.rs",
     "rust/src/tokenizer/src/incremental.rs"]
+# 不因文件隐藏属性而自动跳过；显式排除规则仍然生效，例如上面的 .git/*。
 ignore-hidden = false
 
+# 跳过包含 UE4M3、UE8M0 等形式的标识符；U、E、M 分别允许大小写。
 [tool.typos.default]
 extend-ignore-identifiers-re = [".*[Uu][Ee][0-9][Mm][0-9].*"]
 
+# 对完整标识符设置拼写映射；左右相同表示接受现有拼写，不建议替换。
+# 可用于保留外部 API 名称或项目既有名称；这里的条目不会重命名源码符号。
 [tool.typos.default.extend-identifiers]
 a63ede7 = "a63ede7"
 bbc5b7ede = "bbc5b7ede"
@@ -155,6 +199,8 @@ k_ot = "k_ot"
 view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
+# 单词级拼写映射，用于接受领域缩写等；与上方完整标识符映射的粒度不同。
+# 以下同值映射均保留原拼写，无需逐项将其解释为程序变量或配置开关。
 [tool.typos.default.extend-words]
 Hel = "Hel"
 wether = "wether"
@@ -191,5 +237,6 @@ WHT = "WHT"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
 
+# 仅对 torch 禁用 uv 的构建隔离，不代表对 vLLM 或所有依赖禁用隔离。
 [tool.uv]
 no-build-isolation-package = ["torch"]

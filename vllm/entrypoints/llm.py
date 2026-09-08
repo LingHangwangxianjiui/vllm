@@ -458,6 +458,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             A list of `RequestOutput` objects containing the
             generated completions in the same order as the input prompts.
         """
+        # 此入口要求生成式 runner；校验发生在请求预处理和入队之前。
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError(
@@ -466,9 +467,14 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                 "generative model."
             )
 
+        # 未显式传参时，从模型配置获取默认采样参数；没有差异配置则使用
+        # SamplingParams()。显式传入的参数不会在此与模型默认配置合并。
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
 
+        # 下游先将输入统一为请求序列、校验参数数量，再预处理并入队。
+        # 随后同步循环调用引擎 step()，直到引擎中所有未完成请求结束；
+        # 收集完成结果并按请求 ID 排序，因此返回顺序不取决于完成先后。
         return self._run_completion(
             prompts=prompts,
             params=sampling_params,

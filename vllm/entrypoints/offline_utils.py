@@ -308,11 +308,18 @@ class OfflineInferenceMixin:
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
+        # 统一为请求序列：单个字符串、字典或非空 token ID 列表视为一个 prompt。
         seq_prompts = prompt_to_seq(prompts)
+        # 单个 params/LoRA 按请求数重复引用，序列则校验长度；此处不复制对象。
+        # 未指定 priority 时为每个请求填 0，保证后续可按同一索引配对。
         seq_params = self._params_to_seq(params, len(seq_prompts))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_prompts))
         seq_priority = self._priority_to_seq(priority, len(seq_prompts))
 
+        # 生成器由下游逐项消费：每个 prompt 转为 EngineInput 后立即提交，
+        # 无需先完成整批预处理；这里的进度条表示输入处理进度。
+        # 返回请求 ID 列表，不在此调用引擎 step() 等待生成结果。
+        # 若中途失败，下游会中止本次调用中已成功添加并记录 ID 的请求。
         return self._render_and_add_requests(
             prompts=(
                 self._preprocess_cmpl_one(

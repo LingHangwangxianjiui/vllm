@@ -1,6 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# =============================================================================
+# 本文件职责：vLLM 的"参数中枢"。把三路来源（CLI 字符串 / 环境变量 / Python API
+# kwargs）统一收敛进 EngineArgs，再校验、推导、装配出最终的 VllmConfig。
+#
+# 在系统链路中的位置（控制面，进程启动期执行一次）：
+#   CLI  :   vllm serve / vllm bench -> FlexibleArgumentParser
+#              -> EngineArgs.add_cli_args()   （注册参数）
+#              -> EngineArgs.from_cli_args()  （Namespace -> EngineArgs）
+#   API  :   LLM(...) / AsyncLLM(...) -> EngineArgs(**kwargs)
+#   ENV  :   vllm.envs.* / 平台环境变量 -> 作为各 *Config 字段的默认值参与合并
+#   三者汇合于 EngineArgs -> create_engine_config() -> VllmConfig
+#            -> LLMEngine / EngineCore -> Worker -> ModelRunner（数据面）
+#
+# 核心内容速查：
+#   - EngineArgs              : 数百个字段的扁平 dataclass，所有参数的总入口
+#   - EngineArgs.add_cli_args : 由子配置类的类型注解反射生成 argparse 参数
+#   - create_engine_config    : 装配 VllmConfig 的主流程（本文件最重要的函数）
+#   - create_*_config         : 各子配置的工厂方法（Model/Load/Cache/...）
+#   - _set_default_*_args     : 依赖模型与硬件的默认值推导，在装配中途调用
+#   - _compute_kwargs / get_kwargs : 类型注解 -> argparse kwargs 的反射层
+#   - AsyncEngineArgs         : 在 EngineArgs 上追加异步引擎专属参数
+#
+# 三套配置来源的优先级（由高到低）：
+#   1) 显式传入：CLI 上真正写出的参数、Python API 显式传入的 kwargs
+#   2) 环境变量：vllm.envs.* 以及各平台相关环境变量
+#   3) 代码默认值：各 *Config dataclass 字段上的字面量默认值
+#   合并机制：环境变量被"折叠"进 vllm/config/ 下各 *Config 的字段默认值里，
+#   因此当 CLI 没有显式给出某参数时，argparse 拿到的 default 本身就是环境变量
+#   的值 —— 环境变量天然比显式参数低一级。环境变量整体的合法性由
+#   envs.validate_environ() 在 create_engine_config() 中统一校验。
+#
+# 阅读提示（本文件最容易踩的坑）：
+#   - add_cli_args 中大量 {"default": None} 覆盖并不是"把默认值改成 None"，而是
+#     拿 None 当"用户未指定"的哨兵，好让 _set_default_*_args 在拿到 ModelConfig /
+#     ParallelConfig 之后按模型和硬件推导真实默认值（enable_prefix_caching、
+#     enable_chunked_prefill、max_num_batched_tokens、max_num_seqs 都是如此）。
+#     这也解释了为什么装配后期有多处 assert xxx is not None。
+#   - create_engine_config() 里各子配置的装配顺序是依赖关系，不能随意调换：
+#     ModelConfig 最先产出（后续所有推导都要用它）-> CacheConfig（依赖模型能力）
+#     -> ParallelConfig（DP/EP/节点拓扑推导）-> SpeculativeConfig / SchedulerConfig
+#     （依赖前三者）-> LoRA 等与投机解码做交叉校验 -> 各 override 覆盖 -> VllmConfig。
+#   - "顶层扁平参数"与"嵌套 config"重复指定通常互斥（如 --attention-backend 与
+#     --attention-config.backend），本文件统一用 ValueError 直接拒绝。
+#   - 已废弃（deprecated）字段的处理不在这个文件里做：旧参数要么在 vllm/config/
+#     下各 dataclass 的 __post_init__ 中被迁移到新字段，要么直接不再注册为 CLI
+#     参数（例如多步调度的相关参数已被移除）。本文件只保留一个显式开关
+#     allow_deprecated_quantization，用于放行已废弃的量化方法。
+# =============================================================================
+
 import argparse
 import copy
 import dataclasses
@@ -141,11 +190,18 @@ logger = init_logger(__name__)
 
 # object is used to allow for special typing forms
 T = TypeVar("T")
+# 类型注解既可能是普通 class，也可能是 Literal / Union / Annotated 这类"特殊
+# 类型形式"（typing 对象，不是 type 的实例），所以放宽成 object 来兼容两者
 TypeHint: TypeAlias = type[Any] | object
 TypeHintT: TypeAlias = type[T] | object
 
 
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
+    """把普通的字符串转换函数包装成 argparse 可用的 type= 回调。
+
+    argparse 要求 type 回调失败时抛 ArgumentTypeError；直接抛 ValueError 会被
+    当成未捕获异常并吐出一长串 traceback，所以这里做一次异常类型转换。
+    """
     def _parse_type(val: str) -> T:
         try:
             return return_type(val)
@@ -158,6 +214,11 @@ def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
 
 
 def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
+    """让 argparse 参数支持"显式置空"。
+
+    空串与字面量 "None" 都解析为 Python None，这样用户才能在命令行上覆盖掉一个
+    默认非 None 的值（例如把 kv_cache_memory_bytes 重新置回"不限制"）。
+    """
     def _optional_type(val: str) -> T | None:
         if val == "" or val == "None":
             return None
@@ -167,9 +228,18 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
+    """解析 `str | dict` 联合类型：整体形如 JSON 对象就当 dict，否则当普通字符串。
+
+    这样同一个 CLI 参数既能接受"名字 / 路径"这类字符串，也能接受内联 JSON 配置。
+    """
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
     return optional_type(json.loads)(val)
+
+
+# 下面三个是类型注解集合上的基础谓词/取值工具。之所以要用集合而不是单个类型，
+# 是因为一个字段的注解可能是 Optional[Literal[...]] 这种嵌套形式，展开后是多个
+# 候选类型的集合。is_type 同时兼容 `int` 和 `list[int]`（后者靠 get_origin）。
 
 
 def is_type(type_hint: TypeHint, type: TypeHintT) -> TypeIs[TypeHintT]:
@@ -187,6 +257,8 @@ def get_type(type_hints: set[TypeHint], type: TypeHintT) -> TypeHintT:
     return next((th for th in type_hints if is_type(th, type)), None)
 
 
+# Literal 注解在 CLI 上表现为 choices（枚举值）。但如果注解里同时含 str，说明
+# 还允许传入任意字符串（典型如后端名/插件名），此时只能用 metavar 提示而不能限制。
 def literal_to_kwargs(type_hints: set[TypeHint]) -> dict[str, Any]:
     """Get the `type` and `choices` from a `Literal` type hint in `type_hints`.
 
@@ -205,6 +277,11 @@ def literal_to_kwargs(type_hints: set[TypeHint]) -> dict[str, Any]:
 
 
 def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str, Any]:
+    """把 list/set/tuple 注解转成 argparse 的 type + nargs。
+
+    tuple[int, int] 这种定长写法会解析成固定 nargs=2；tuple[int, ...] 与
+    list/set 则用 nargs="+" 表示"一个或多个"。
+    """
     type_hint = get_type(type_hints, type)
     types = get_args(type_hint)
     elem_type = types[0]
@@ -229,6 +306,8 @@ def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str,
     }
 
 
+# 非 builtins 的类型（例如 vllm 自己的枚举、平台类）在 CLI 上一律按字符串接收，
+# 真正的解析交给下游的 pydantic / 枚举构造函数。
 def is_not_builtin(type_hint: TypeHint) -> bool:
     """Check if the class is not a built-in type."""
     return type_hint.__module__ != "builtins"
@@ -236,6 +315,8 @@ def is_not_builtin(type_hint: TypeHint) -> bool:
 
 def get_type_hints(type_hint: TypeHint) -> set[TypeHint]:
     """Extract type hints from Annotated or Union type hints."""
+    # 把 Optional[X] / X | Y / Annotated[X, ...] 递归"摊平"成候选类型的集合，
+    # 供上面的 contains_type / get_type 做判定。
     type_hints: set[TypeHint] = set()
     origin = get_origin(type_hint)
     args = get_args(type_hint)
@@ -252,6 +333,9 @@ def get_type_hints(type_hint: TypeHint) -> set[TypeHint]:
     return type_hints
 
 
+# 只有在真正需要生成帮助文本时才去解析字段注释（get_attr_docs 要读源码，很慢），
+# 因此用一个模块级开关提前判断：命令行里带 --help，或者正在跑 mkdocs 生成文档。
+# 注意这是 import 期就固定的常量，运行期再改 sys.argv 不会影响它。
 NEEDS_HELP = (
     any("--help" in arg for arg in sys.argv)  # vllm SUBCOMMAND --help
     or "mkdocs" in sys.modules  # mkdocs SUBCOMMAND
@@ -260,6 +344,7 @@ NEEDS_HELP = (
 
 def _maybe_add_docs_url(cls: Any) -> str:
     """Generate API docs URL for a vllm config class."""
+    # 只为 vllm.config 顶层导出的配置类加链接，插件自带的类会被跳过（返回空串）
     import vllm.config
 
     name = cls.__name__
@@ -279,6 +364,10 @@ def _expand_json_human_readable_numbers(val: str) -> str:
 
     Only bare (unquoted) tokens are replaced so that JSON string values
     like ``"model_name"`` are never modified.
+
+    中文补充：这是为了让 `--kv-transfer-config '{"cpu_bytes_to_use": 80m}'` 这类
+    内联 JSON 也能用人类可读后缀。按引号切分后只处理偶数段（引号外的区域），
+    避免把字符串值里的 "80m" 之类的内容误改掉。
     """
     # Split on quoted strings so we only touch non-string regions.
     parts = re.split(r'("(?:[^"\\]|\\.)*")', val)
@@ -293,6 +382,22 @@ def _expand_json_human_readable_numbers(val: str) -> str:
 
 @functools.lru_cache(maxsize=30)
 def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
+    """反射一个配置 dataclass，生成 {字段名: argparse 关键字参数} 映射。
+
+    这是"一处定义驱动 CLI"的关键：CLI 参数不手写，而是从 *Config 字段的**类型注解**
+    推导 type/choices/nargs/action，从字段注释推导 help 文本。新增一个配置字段，
+    CLI 参数就自动生成。
+
+    Args:
+        cls: vllm 的配置 dataclass，如 ModelConfig / CacheConfig / SchedulerConfig
+
+    Returns:
+        {field_name: {"default": ..., "help": ..., "type"/"action"/...: ...}}
+
+    Note:
+        结果被 lru_cache 缓存；调用方应通过 get_kwargs() 拿深拷贝后再修改，
+        否则对返回值的改动会污染缓存、影响后续所有调用者。
+    """
     # Save time only getting attr docs if we're generating help text
     cls_docs = get_attr_docs(cls) if NEEDS_HELP else {}
     kwargs = {}
@@ -332,6 +437,9 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
         json_tip = (
             "Should either be a valid JSON string or JSON keys passed individually."
         )
+        # 下面是一条"按类型注解分派"的判定链，顺序有讲究：越特殊的越靠前。
+        # dataclass(整块 JSON) > Optional[str|bool] > bool > Literal > tuple/list/set
+        # > int > float > dict > str，兜底则报错。放错顺序会导致注解被误判。
         if dataclass_cls is not None:
 
             def parse_dataclass(val: str, cls=dataclass_cls) -> Any:
@@ -362,6 +470,7 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
             kwargs[name].update(collection_to_kwargs(type_hints, set))
         elif contains_type(type_hints, int):
             # Arguments that accept human-readable integer strings (e.g., 1K, 2M, 1G)
+            # 这几个字段的量级天然很大（token 数、显存字节），允许写成 8K / 2G
             human_readable_int_args = {
                 "max_num_batched_tokens",
                 "max_num_scheduled_tokens",
@@ -401,6 +510,8 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
 
         # If None is in type_hints, make the argument optional.
         # But not if it's a bool, argparse will handle this better.
+        # 注解里含 None（即 Optional[...]）时允许显式传 None，但 bool 除外——
+        # bool 由 BooleanOptionalAction 生成的 --x / --no-x 已经足够表达三态。
         if type(None) in type_hints and not contains_type(type_hints, bool):
             kwargs[name]["type"] = optional_type(kwargs[name]["type"])
             if kwargs[name].get("choices"):
@@ -408,6 +519,8 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return kwargs
 
 
+# get_kwargs 是 _compute_kwargs 对外的唯一入口：深拷贝一份缓存结果再返回，
+# 因为调用方（add_cli_args 等）经常要就地改 default / choices。
 def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     """Return argparse kwargs for the given Config dataclass.
 
@@ -421,10 +534,25 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
+# -----------------------------------------------------------------------------
+# EngineArgs：所有配置来源汇合后的"扁平总入口"。
+#
+# 为什么是扁平的？因为 CLI 只认一层 --xxx 参数。这里把十几个子配置（ModelConfig、
+# CacheConfig、ParallelConfig、SchedulerConfig ...）的字段全部提升为同级字段，
+# 再由 create_engine_config() 按依赖顺序重新分组装配回去。
+#
+# 字段默认值的来源（见文件头的优先级说明）：绝大多数写成形如
+#   `max_model_len: int = ModelConfig.max_model_len`
+# 即"以对应子配置类的字段默认值为默认值"，而子配置的默认值本身可能来自环境变量，
+# 因此环境变量被自动折叠进了这里。少数以 `= None` 出现的字段（block_size、
+# enable_prefix_caching、max_num_batched_tokens、max_num_seqs 等）是"用户未指定"
+# 的哨兵，真实值要等拿到 ModelConfig / 硬件信息后在 _set_default_*_args 里推导。
+# -----------------------------------------------------------------------------
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
 
+    # ---------------- 模型与 tokenizer（对应 ModelConfig / LoadConfig） ----------------
     model: str = ModelConfig.model
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
     return_sampling_mask: bool = ModelConfig.return_sampling_mask
@@ -459,6 +587,7 @@ class EngineArgs:
         CompilationConfig, "max_cudagraph_capture_size"
     )
     ir_op_priority: IrOpPriorityConfig = get_field(KernelConfig, "ir_op_priority")
+    # ---------------- 并行与分布式（ParallelConfig / KernelConfig） ----------------
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -523,6 +652,9 @@ class EngineArgs:
     max_parallel_loading_workers: int | None = (
         ParallelConfig.max_parallel_loading_workers
     )
+    # ---------------- KV cache（CacheConfig） ----------------
+    # 这几个 None 是"用户未指定"哨兵：block_size 由平台/attention backend 决定，
+    # enable_prefix_caching 由模型是否支持决定，二者都在装配期推导。
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
@@ -572,6 +704,7 @@ class EngineArgs:
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
+    # ---------------- 多模态（MultiModalConfig） ----------------
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
         MultiModalConfig, "limit_per_prompt"
@@ -615,6 +748,8 @@ class EngineArgs:
     mm_ipc_gpu_memory_gb: float = MultiModalConfig.mm_ipc_gpu_memory_gb
     mm_device_do_normalize: bool | None = MultiModalConfig.mm_device_do_normalize
     # LoRA fields
+    # LoRAConfig 是"可选子配置"：enable_lora=False 时 create_engine_config 会直接
+    # 返回 None，下面这些字段即使被设置也不会生效。
     enable_lora: bool = False
     max_loras: int = LoRAConfig.max_loras
     max_lora_rank: MaxLoRARanks = LoRAConfig.max_lora_rank
@@ -633,6 +768,8 @@ class EngineArgs:
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
+    # ---------------- 调度（SchedulerConfig） ----------------
+    # 同样是"未指定"哨兵，依赖模型能力与硬件在 _set_default_*_args 中推导
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
@@ -775,6 +912,19 @@ class EngineArgs:
     kda_prefill_backend: Literal["auto", "triton", "flashkda"] | None = None
 
     def __post_init__(self):
+        """构造后的自动规范化。三件事：
+
+        1. 把仍是 dict 的嵌套配置字段升级为真正的配置对象，使得 Python API 可以
+           直接写 EngineArgs(compilation_config={...}) 而不必手工构造对象；
+        2. 解析 quantization / quantization_config（前者是快捷名，后者是完整
+           QuantizationConfigArgs），统一成规范化后的 quantization_config；
+        3. 加载插件；当 HuggingFace 处于离线模式时，把 model / tokenizer 的
+           repo id 改写成本地缓存路径。
+
+        Note:
+            会执行 load_general_plugins()，这是有副作用的操作（插件可注册新的
+            后端、量化方法、平台等，进而影响后续所有默认值与校验）。
+        """
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
@@ -795,6 +945,8 @@ class EngineArgs:
                 **self.weight_transfer_config
             )
         if isinstance(self.fault_tolerance_config, dict):
+            # 隐式约束：只要用户显式传了容错配置，就认为他想开启容错，
+            # 不必再单独写 --enable-fault-tolerance。
             if not self.enable_fault_tolerance:
                 logger.warning(
                     "--fault-tolerance-config was passed. Fault tolerance is being "
@@ -846,8 +998,13 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+        # 中文补充：把 EngineArgs 的字段注册到 argparse 上。每个子配置对应一个
+        # argument_group，参数名统一为 --连字符形式，而 kwargs（默认值、help、
+        # type/choices）由 get_kwargs(子配置类) 反射得到。
 
         # Model arguments
+        # 例外：`vllm serve --help` 时不注册 --model，避免与 serve 子命令自己的
+        # model 参数冲突/重复。
         model_kwargs = get_kwargs(ModelConfig)
         model_group = parser.add_argument_group(
             title="ModelConfig",
@@ -951,6 +1108,7 @@ class EngineArgs:
         )
 
         # Model loading arguments
+        # 权重加载相关：load_format 决定走哪种 loader，ignore_patterns 用于跳过权重
         load_kwargs = get_kwargs(LoadConfig)
         load_group = parser.add_argument_group(
             title="LoadConfig",
@@ -1024,6 +1182,7 @@ class EngineArgs:
         )
 
         # Parallel arguments
+        # TP/PP/EP/DP/CP 各种并行度与分布式后端都在这里注册
         parallel_kwargs = get_kwargs(ParallelConfig)
         parallel_group = parser.add_argument_group(
             title="ParallelConfig",
@@ -1233,6 +1392,9 @@ class EngineArgs:
         )
 
         # KV cache arguments
+        # 显存与 KV cache 相关。注意 --enable-prefix-caching 的 default 被强制改成
+        # None（哨兵），以便后续按模型能力推导；直接沿用 CacheConfig 的默认值会让
+        # "用户未指定" 和 "用户显式指定为默认值" 无法区分。
         cache_kwargs = get_kwargs(CacheConfig)
         cache_group = parser.add_argument_group(
             title="CacheConfig",
@@ -1296,6 +1458,8 @@ class EngineArgs:
         )
 
         # Model weight offload related configs
+        # 三种权重卸载策略共用一个 CLI group：基础 OffloadConfig + UVA(统一虚拟寻址)
+        # + Prefetch(预取)，最终在 create_engine_config 里组装成一个 OffloadConfig。
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
@@ -1494,6 +1658,9 @@ class EngineArgs:
             "--otlp-traces-endpoint", **observability_kwargs["otlp_traces_endpoint"]
         )
         # TODO: generalise this special case
+        # 特例：--collect-detailed-traces 允许一次传多个模块（用逗号连接），而
+        # choices 只有单项。这里额外把所有两项排列组合也加进 choices，并改用
+        # metavar 展示，否则 argparse 会把 "model,worker" 判为非法值。
         choices = observability_kwargs["collect_detailed_traces"]["choices"]
         metavar = f"{{{','.join(choices)}}}"
         observability_kwargs["collect_detailed_traces"]["metavar"] = metavar
@@ -1541,6 +1708,9 @@ class EngineArgs:
         )
 
         # Scheduler arguments
+        # 注意 --max-num-batched-tokens / --max-num-seqs / --enable-chunked-prefill
+        # 的 default 都被改成 None：它们的合理值依赖模型长度与硬件，必须延后到
+        # _set_default_max_num_seqs_and_batched_tokens_args 里推导。
         scheduler_kwargs = get_kwargs(SchedulerConfig)
         scheduler_group = parser.add_argument_group(
             title="SchedulerConfig",
@@ -1580,6 +1750,8 @@ class EngineArgs:
         )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
+        # （已废弃能力）V1 移除了多步调度，相关参数不再注册；这里保留注释以说明
+        # 为什么下面直接跳到了 --scheduling-policy。
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
@@ -1645,6 +1817,7 @@ class EngineArgs:
             "--enable-bf16x3-router-gemm",
             **kernel_kwargs["enable_bf16x3_router_gemm"],
         )
+        # 后端名在 CLI 上可能写成 FlashInfer / flash-infer 等风格，先统一成小写下划线
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
@@ -1653,6 +1826,7 @@ class EngineArgs:
         kernel_group.add_argument("--linear-backend", **linear_backend_kwargs)
 
         # vLLM arguments
+        # 这一组是"挂在 VllmConfig 上、但不属于任何单个子配置"的顶层参数。
         vllm_kwargs = get_kwargs(VllmConfig)
         vllm_group = parser.add_argument_group(
             title="VllmConfig",
@@ -1661,10 +1835,15 @@ class EngineArgs:
         # We construct SpeculativeConfig using fields from other configs in
         # create_engine_config. So we set the type to a JSON string here to
         # delay the Pydantic validation that comes with SpeculativeConfig.
+        # 中文补充：投机解码配置依赖 ModelConfig / ParallelConfig（如目标模型信息），
+        # 因此 CLI 阶段只解析成裸 JSON dict，真正的 pydantic 校验推迟到
+        # create_speculative_config() 拿到上下游配置之后再做。
         vllm_kwargs["speculative_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--speculative-config", "-sc", **vllm_kwargs["speculative_config"]
         )
+        # --spec-method / --spec-model / --spec-tokens 是 --speculative-config 的
+        # 便捷写法，两者互斥（见 create_speculative_config 里的互斥校验）。
         speculative_kwargs = get_kwargs(SpeculativeConfig)
         vllm_group.add_argument("--spec-method", **speculative_kwargs["method"])
         vllm_group.add_argument("--spec-model", **speculative_kwargs["model"])
@@ -1709,6 +1888,7 @@ class EngineArgs:
         )
 
         # Other arguments
+        # 不属于任何子配置的零散开关，直接挂在 parser 根上（不进任何 group）
         parser.add_argument(
             "--disable-log-stats",
             action="store_true",
@@ -1755,6 +1935,12 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        """把 argparse 的 Namespace 转成 EngineArgs。
+
+        只挑 EngineArgs 里真实存在且 Namespace 上也有的字段，这样同一个
+        Namespace 混杂了其它子命令的参数时也不会炸（比如 --host/--port 这类
+        只属于 API server 的参数会被自然忽略）。
+        """
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
 
@@ -1765,6 +1951,17 @@ class EngineArgs:
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
+        """构造 ModelConfig——所有子配置中第一个、也是最基础的一个。
+
+        后续 CacheConfig / ParallelConfig / SchedulerConfig 的默认值推导都要读它
+        （模型是否多模态、是否 MoE、是否支持 chunked prefill、max_model_len 等），
+        所以它在 create_engine_config() 里必须最先产出。
+
+        Note:
+            max_model_len、tokenizer 等字段的真正解析与自动推导发生在 ModelConfig
+            自己的 __post_init__ 里（例如从 HF config 读 max_position_embeddings，
+            并把显式设置与模型上限做校验），这里只负责搬运参数。
+        """
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.warning(
                 "The global random seed is set to %d. Since "
@@ -1847,6 +2044,8 @@ class EngineArgs:
         )
 
     def validate_tensorizer_args(self):
+        """把散落在 model_loader_extra_config 顶层的 tensorizer 字段收敛进
+        model_loader_extra_config["tensorizer_config"]。"""
         from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 
         for key in self.model_loader_extra_config:
@@ -1856,7 +2055,10 @@ class EngineArgs:
                 )
 
     def create_load_config(self) -> LoadConfig:
+        """构造 LoadConfig；tensorizer 是唯一需要额外搬运转参的 loader。"""
         if self.load_format == "tensorizer":
+            # tensorizer 的配置历史上是直接平铺在 model_loader_extra_config 里的，
+            # 这里把它规整到 "tensorizer_config" 子键下再传给 LoadConfig。
             if hasattr(self.model_loader_extra_config, "to_serializable"):
                 self.model_loader_extra_config = (
                     self.model_loader_extra_config.to_serializable()
@@ -1886,6 +2088,14 @@ class EngineArgs:
     ) -> SpeculativeConfig | None:
         """Initializes and returns a SpeculativeConfig object based on
         `speculative_config`.
+
+        中文补充：这是"延迟校验"的落地处。CLI 只把 --speculative-config 解析成裸
+        dict，这里先把 --spec-method/--spec-model/--spec-tokens 三个便捷参数合入
+        （与 dict 内同名字段互斥），再注入必须来自其它配置的 target_model_config /
+        target_parallel_config，最后才交给 SpeculativeConfig 做 pydantic 校验。
+
+        Returns:
+            未配置投机解码时返回 None。
         """
         for flag, key, value in (
             ("--spec-method", "method", self.spec_method),
@@ -1905,6 +2115,7 @@ class EngineArgs:
         if self.speculative_config is None:
             return None
 
+        # CLI 上习惯写 "num-speculative-tokens" 这类连字符，统一成下划线字段名
         self.speculative_config = {
             k.replace("-", "_"): v for k, v in self.speculative_config.items()
         }
@@ -1921,6 +2132,15 @@ class EngineArgs:
         return SpeculativeConfig(**self.speculative_config)
 
     def _resolve_device_ids(self) -> list[int] | None:
+        """把 --device-ids 解析成物理设备 id 列表。
+
+        支持两种写法：整数（CUDA 序号）或 UUID 字符串，但不能混用。整数写法还会
+        与 CUDA_VISIBLE_DEVICES 复合——此时 --device-ids 的值被当作"在 CVD 可见
+        设备集合中的下标"，而不是物理 id。
+
+        Returns:
+            物理设备 id 列表；未指定 --device-ids 时返回 None。
+        """
         if not self.device_ids:
             return None
         if self.distributed_executor_backend == "ray":
@@ -1962,6 +2182,10 @@ class EngineArgs:
         return int_ids
 
     def create_diffusion_config(self) -> DiffusionConfig | None:
+        """构造 DiffusionConfig；未启用扩散模型时返回 None。
+
+        cfg 允许是 JSON 字符串（CLI 传入）或 dict（Python API 传入）。
+        """
         if self.diffusion_config is None:
             return None
         cfg = self.diffusion_config
@@ -1970,6 +2194,7 @@ class EngineArgs:
         return DiffusionConfig(**cfg)
 
     def create_observability_config(self) -> ObservabilityConfig:
+        """把分散在 EngineArgs 上的可观测性字段收集成 ObservabilityConfig。"""
         return ObservabilityConfig(
             show_hidden_metrics_for_version=self.show_hidden_metrics_for_version,
             otlp_traces_endpoint=self.otlp_traces_endpoint,
@@ -1995,11 +2220,32 @@ class EngineArgs:
         Create the VllmConfig.
 
         NOTE: If VllmConfig is incompatible, we raise an error.
+
+        中文补充：装配顺序（每一步都依赖前一步的结果，不能随意调换）：
+          1. DeviceConfig（平台探测）+ 环境变量整体校验 envs.validate_environ()
+          2. speculators 探测并改写 model/tokenizer/speculative_config
+          3. ModelConfig   <- 后续所有推导的基础
+          4. _check_feature_supported / _set_default_chunked_prefill_and_prefix_caching_args
+             _set_default_reasoning_config_args（依赖模型能力的默认值推导）
+          5. CacheConfig   <- 依赖 ModelConfig（is_attention_free、sliding_window、kv dtype）
+          6. DP/EP/多节点拓扑推导 -> ParallelConfig
+          7. SpeculativeConfig / DiffusionConfig（依赖 ModelConfig + ParallelConfig）
+          8. _set_default_max_num_seqs_and_batched_tokens_args -> SchedulerConfig
+          9. LoRAConfig（并与投机解码做交叉校验）
+         10. attention / mamba / kernel / compilation 等顶层参数对嵌套 config 的覆盖
+         11. LoadConfig、ObservabilityConfig、OffloadConfig、additional_config
+         12. 汇总成 VllmConfig 返回。
+
+        Note:
+            本方法会就地修改 self（例如把推导出的默认值写回 enable_prefix_caching、
+            max_num_seqs 等字段），因此重复调用是幂等的但并非无副作用。
         """
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
+        # 环境变量优先于代码默认值、低于显式参数：这里是唯一一处整体校验点，
+        # 默认只告警，fail_on_environ_validation=True 时才抛错。
         envs.validate_environ(self.fail_on_environ_validation)
 
         # Check if the model is a speculator and override model/tokenizer/config
@@ -2019,6 +2265,8 @@ class EngineArgs:
                 )
             )
 
+        # ModelConfig 里可能修正 model / model_weights / tokenizer（离线路径改写、
+        # speculators 重写等），回写 self 以保证 EngineArgs 与配置保持一致。
         model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
@@ -2027,6 +2275,9 @@ class EngineArgs:
         self._check_feature_supported()
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()
+        # 隐含约束：只有"全滑动窗口"模型才把 sliding_window 交给 CacheConfig 统一管理。
+        # 交错式（interleaved）滑动窗口模型若在此设置，会让 CacheConfig 的值覆盖掉
+        # 全局层的行为，所以这种情况保持 None。
         sliding_window: int | None = None
         layer_types = getattr(model_config.hf_text_config, "layer_types", None)
         if layer_types is None or all(lt == "sliding_attention" for lt in layer_types):
@@ -2036,10 +2287,12 @@ class EngineArgs:
             sliding_window = model_config.get_sliding_window()
 
         # Resolve "auto" kv_cache_dtype to actual value from model config
+        # "auto" 只是一种意图声明，真正落到什么精度要按模型配置决定，这里解析成实际值。
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
         )
 
+        # 哨兵必须已被 _set_default_chunked_prefill_and_prefix_caching_args 消除
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
         )
@@ -2068,6 +2321,8 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        # TurboQuant 的边界层不能量化，把模型算出的 boundary 层并入 skip_layers
+        # （按 int 排序，因为层名在此处是数字字符串）。
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
@@ -2106,6 +2361,13 @@ class EngineArgs:
             # but we should not do this here.
             placement_group = ray.util.get_current_placement_group()
 
+        # ------------------------------------------------------------------
+        # 数据并行（DP）部署形态推导。三种互斥形态：
+        #   internal LB（默认，vLLM 内部负载均衡）
+        #   external LB（外部负载均衡器，每个 rank 一个实例，需要显式 rank）
+        #   hybrid LB  （多节点混合：节点内 internal、节点间 external）
+        # 下面这段大量校验的意义在于：这些组合错误在运行时极难排查，必须在启动期拒绝。
+        # ------------------------------------------------------------------
         assert not headless or not self.data_parallel_hybrid_lb, (
             "data_parallel_hybrid_lb is not applicable in headless mode"
         )
@@ -2124,6 +2386,8 @@ class EngineArgs:
                 f"`--data-parallel-backend {self.data_parallel_backend}`. "
                 "Use the MP backend or set `--nnodes 1`."
             )
+        # 多节点时：总 world size 必须能被节点数整除，才能均分出每节点的本地规模；
+        # 并据此由 node_rank 反推出本节点的 data_parallel_rank。
         inferred_data_parallel_rank = 0
         if self.nnodes > 1:
             world_size_within_dp = (
@@ -2166,6 +2430,7 @@ class EngineArgs:
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
+        # 启用容错必须配合外部 LB：内部 LB 下没有独立的 rank 身份，无法做故障接管
         if self.enable_fault_tolerance and not data_parallel_external_lb:
             raise ValueError(
                 "Fault tolerance requires external load balancer mode "
@@ -2412,6 +2677,8 @@ class EngineArgs:
             else None
         )
 
+        # LoRA + 投机解码的交叉约束：一个 step 内必须能放下所有序列的
+        # (1 + num_speculative_tokens) 个 token，否则调度会永远凑不满一批。
         if (
             lora_config is not None
             and speculative_config is not None
@@ -2426,6 +2693,10 @@ class EngineArgs:
                 "decreasing num_speculative_tokens"
             )
 
+        # ------------------------------------------------------------------
+        # 以下若干段是同一模式的重复："顶层扁平参数" 覆盖 "嵌套 config 字段"。
+        # 二者互斥，重复指定抛 ValueError；copy.deepcopy 保证不改用户传入的对象。
+        # ------------------------------------------------------------------
         # Attention config overrides
         attention_config = copy.deepcopy(self.attention_config)
         if self.attention_backend is not None:
@@ -2563,11 +2834,15 @@ class EngineArgs:
             ),
         )
 
+        # 把 gdn/kda 的 prefill 后端选择塞进 additional_config：它们属于实验性
+        # 后端开关，没有进入任何正式子配置，只能走这个"杂项口袋"。
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
         if self.kda_prefill_backend is not None:
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
 
+        # 最终汇总：所有子配置在此合体。注意传入的都是"已完成推导与覆盖"的对象，
+        # VllmConfig 自身的 __post_init__ 还会再做一轮跨配置一致性校验。
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -2602,6 +2877,8 @@ class EngineArgs:
 
     def _check_feature_supported(self):
         """Raise an error if the feature is not supported."""
+        # 中文补充：目前只校验流水线并行（PP）——自定义 executor backend 必须显式
+        # 声明 supports_pp，或落在 ray / mp / external_launcher 这几个已知后端内。
         if self.pipeline_parallel_size > 1:
             supports_pp = getattr(
                 self.distributed_executor_backend, "supports_pp", False
@@ -2626,6 +2903,8 @@ class EngineArgs:
     ) -> tuple[dict[UsageContext | None, int], dict[UsageContext | None, int]]:
         from vllm.usage.usage_lib import UsageContext
 
+        # 两个返回值都是 "usage context -> 默认值" 的映射：离线 LLM 类与在线 OpenAI
+        # API server 的负载特征不同（后者请求更碎、并发更高），所以默认值不同。
         default_max_num_batched_tokens: dict[UsageContext | None, int]
         default_max_num_seqs: dict[UsageContext | None, int]
 
@@ -2649,6 +2928,8 @@ class EngineArgs:
         # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces
         # throughput, see PR #17885 for more details.
         # So here we do an extra device name check to prevent such regression.
+        # 按显存容量分档选默认值，而不是按型号硬编码：>=160GB（B200/B300 档）取最大，
+        # >=70GB 且非 A100（H100/H200 档）次之，其余（含 A100）取保守值。
         if device_memory >= 160 * GiB_bytes:
             # for GPUs like B200/B300 with >= 160GB memory, use the largest defaults
             default_max_num_batched_tokens = {
@@ -2680,6 +2961,8 @@ class EngineArgs:
                 UsageContext.OPENAI_API_SERVER: 256,
             }
 
+        # TPU / CPU 平台没有上面的分档逻辑，直接按芯片型号覆盖；且它们的默认值
+        # 与 world_size 成正比（每个 rank 一份预算）。
         # tpu specific default values.
         if current_platform.is_tpu():
             chip_name = current_platform.get_device_name()
@@ -2716,6 +2999,13 @@ class EngineArgs:
     def _set_default_chunked_prefill_and_prefix_caching_args(
         self, model_config: ModelConfig
     ) -> None:
+        """消除 enable_chunked_prefill / enable_prefix_caching 的哨兵（None）。
+
+        规则：
+          - 未指定时采用"模型是否支持"（ModelConfig 上的能力探测结果）；
+          - 显式指定但与模型能力冲突时只 warning 不报错（尊重用户，风险自负）；
+          - RISC-V CPU 上两者被无条件关闭（V1 后端不支持）。
+        """
         default_chunked_prefill = model_config.is_chunked_prefill_supported
         default_prefix_caching = model_config.is_prefix_caching_supported
 
@@ -2784,6 +3074,8 @@ class EngineArgs:
             self.enable_prefix_caching = False
 
     def _set_default_reasoning_config_args(self):
+        # reasoning_parser 是 StructuredOutputsConfig 字段的顶层快捷别名；
+        # 传了它就必须保证 reasoning_config 存在（否则新建）。
         if not self.reasoning_parser:
             return
         if self.reasoning_config is None:
@@ -2799,6 +3091,9 @@ class EngineArgs:
 
         Returns (token_count, modality_name) for the most expensive modality,
         or None if the value cannot be determined at this stage.
+
+        中文补充：这里刻意做了"降级"——解析失败或信息不足时返回 None 由调用方
+        忽略，绝不能因为算不出一个默认值就让引擎启动失败。
         """
         try:
             from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -2829,6 +3124,20 @@ class EngineArgs:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ):
+        """推导 max_num_batched_tokens 与 max_num_seqs 的默认值。
+
+        推导次序（后面的约束会覆盖前面的）：
+          1. 按 usage context + 硬件档位取基线（get_batch_defaults）；
+          2. batched DP MoE 走专属常量；
+          3. performance_mode == "throughput" 时把默认值翻倍（仅对"未显式指定"的生效）；
+          4. 关闭 chunked prefill 时，一批至少要装下 max_model_len 个 token；
+          5. 多模态 prefix-LM 需抬到"单个最大多模态 item"的 token 数；
+          6. 上限不超过 max_num_seqs * max_model_len。
+
+        Note:
+            orig_* 两个局部变量用来记住"用户是否显式指定过"，是判断能否被自动
+            调整（翻倍、取 max/min）的依据。
+        """
         world_size = self.pipeline_parallel_size * self.tensor_parallel_size
         (
             default_max_num_batched_tokens,
@@ -2905,6 +3214,8 @@ class EngineArgs:
             )
 
         if orig_max_num_seqs is None:
+            # 只用默认值时保证不会出现"序列数 > 每批 token 数"这种无意义组合：
+            # 每条序列至少要分到 1 个 token。
             assert self.max_num_batched_tokens is not None  # For type checking
             self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
 
@@ -2918,6 +3229,8 @@ class EngineArgs:
 @dataclass
 class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
+    # 中文补充：仅比 EngineArgs 多一个 enable_log_requests；其余全部继承，
+    # 包括 add_cli_args（默认先调用父类注册全部参数，再追加自己的）。
 
     enable_log_requests: bool = False
 
@@ -2928,6 +3241,7 @@ class AsyncEngineArgs(EngineArgs):
         # Initialize plugin to update the parser, for example, The plugin may
         # add a new kind of quantization method to --quantization argument or
         # a new device to --device argument.
+        # 中文补充：插件必须先于参数注册加载，因为它可能往 choices 里追加选项。
         load_general_plugins()
         if not async_args_only:
             parser = EngineArgs.add_cli_args(parser)
@@ -2945,6 +3259,7 @@ class AsyncEngineArgs(EngineArgs):
 
 
 def _raise_unsupported_error(feature_name: str):
+    """统一的"能力不支持"报错入口：所有平台/后端不支持的组合都走这里。"""
     msg = (
         f"{feature_name} is not supported. We recommend to "
         f"remove {feature_name} from your config."

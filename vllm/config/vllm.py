@@ -1,6 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# ==============================================================================
+# 本文件职责：定义 vLLM 的顶层配置容器 VllmConfig，以及配套的"当前配置"全局访问工具。
+#
+# 在系统链路中的位置（控制面，进程启动时构建一次，之后只读）：
+#   EngineArgs(CLI / Python API)
+#     -> 【本文件 VllmConfig】聚合所有子配置
+#     -> ModelConfig / CacheConfig / ParallelConfig / SchedulerConfig /
+#        DeviceConfig / LoadConfig / LoRAConfig / SpeculativeConfig /
+#        CompilationConfig / KVTransferConfig / ObservabilityConfig ...
+#     -> LLMEngine / V1 EngineCore -> Executor -> Worker -> ModelRunner
+#
+# 核心内容速查：
+#   - OptimizationLevel / OPTIMIZATION_LEVEL_* / OPTIMIZATION_LEVEL_TO_CONFIG
+#       : 优化等级（-O0..-O3）及其对应的一整套默认值（多为 callable 判定）
+#   - enable_*_fusion(cfg)      : 各融合 pass 是否启用的运行时判定函数
+#   - VllmConfig                : 总配置类，聚合全部子配置并做跨配置联合校验
+#   - VllmConfig.compute_hash() : 影响计算图的配置指纹（编译/cudagraph 缓存 key）
+#   - VllmConfig.with_hf_config(): 基于已有配置派生一份替换了 hf_config 的新配置
+#   - VllmConfig.__post_init__(): 跨配置联合校验 + 默认值推导的总入口
+#   - try_verify_and_update_config() : 让 model 侧钩子回写本配置
+#   - _set_cudagraph_sizes() / _set_compile_ranges() : 形状相关的尺寸推导
+#   - set_current_vllm_config() / get_current_vllm_config() : 全局"当前配置"上下文
+#
+# 阅读提示：
+#   1. 字段分组：model_config 是唯一没有默认值的必需字段；多数子配置用
+#      Field(default_factory=...) 给出默认实例；LoRA / Speculative / Diffusion /
+#      KVTransfer / KVEvents / ECTransfer / Reasoning / quant_config /
+#      weight_transfer_config 等默认为 None，表示该特性未启用。
+#   2. 跨配置的联合校验集中在 __post_init__ 及其调用的 _verify_* / _validate_* /
+#      _resolve_* 私有方法中；新增约束应就近加在这里，而不是散落到各子配置。
+#   3. __post_init__ 会**就地修改**子配置（推导默认值、降级不兼容开关），所以
+#      "用户显式传入的值"与"最终生效的值"可能不同，调试请以最终对象为准。
+#   4. 序列化与哈希约定：本配置是 pydantic dataclass（见 .utils.config 装饰器），
+#      可直接由 pydantic/msgspec 序列化；参与指纹计算的子配置都要实现
+#      compute_hash()，additional_config 若为 dict 则用
+#      json.dumps(sort_keys=True) 归一化后再哈希，自定义类型需实现 SupportsHash。
+# ==============================================================================
+
 import copy
 import getpass
 import json
@@ -68,10 +106,14 @@ logger = init_logger(__name__)
 
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
+# 这些架构在 ROCm 上要么不被 MRV2 支持、要么更慢，命中后 use_v2_model_runner
+# 会自动退回 V1 model runner（而不是报错）。
 ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
     {"DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
 )
 
+# 默认开启 breakable CUDA graph 的架构白名单：基本都是大模型 / MTP(草稿)架构，
+# 它们用完整图捕获代价过高，切分后收益明显。平台差异见下面的函数。
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -101,6 +143,9 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
 )
 
 
+# 按平台返回"默认启用 breakable CUDA graph"的架构集合；lru_cache 保证
+# current_platform 的探测只做一次。返回空集表示本平台默认不启用（用户仍可
+# 用 VLLM_USE_BREAKABLE_CUDAGRAPH=1 强制打开）。
 @lru_cache
 def default_breakable_cudagraph_architectures() -> frozenset[str]:
     """Architectures defaulting to breakable CUDA graphs on this platform."""
@@ -114,6 +159,9 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 
+# 优化等级：用"启动耗时"换"运行性能"。O0 启动最快、O3 性能最好，默认 O2。
+# 每个等级对应 OPTIMIZATION_LEVEL_TO_CONFIG 中的一组默认值，只覆盖用户没显式
+# 设置的字段（见 _apply_optimization_level_defaults）。
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
 
@@ -131,6 +179,11 @@ class OptimizationLevel(IntEnum):
 
 PerformanceMode = Literal["balanced", "interactivity", "throughput"]
 
+# 【两个全局"是否启用"常量】本意是让优化开关随模型属性动态判定，目前恒为 False。
+# 注释里的 lambda 才是原始设计：按模型是否量化 / 是否为 MoE 决定启用与否。
+# 因为相关优化在这两项上还不稳定（见 issue 25689），统一关闭。
+# 它们是 bool 而非函数，所以 OPTIMIZATION_LEVEL_02/03 里 fuse_attn_quant、enable_sp、
+# fuse_gemm_comms 三项实际恒为 False——读配置时不要误以为它们会按模型自动打开。
 IS_QUANTIZED = False
 IS_DENSE = False
 # The optimizations that depend on these properties currently set to False
@@ -139,6 +192,14 @@ IS_DENSE = False
 #     IS_QUANTIZED = lambda c: c.model_config.is_quantized()
 #     IS_DENSE = lambda c: not c.model_config.is_model_moe()
 # See https://github.com/vllm-project/vllm/issues/25689.
+
+
+# 【融合开关族】下面这组 enable_*_fusion(cfg) 是"运行期判定函数"，不是常量。
+# 它们被塞进 OPTIMIZATION_LEVEL_0x 字典的值位置：解析配置时若发现值是 callable，
+# 就把当前 VllmConfig 传进去求值，得到该模型/平台下此融合是否真的可用。
+# 这样同一份 -O2 默认表在 CUDA、ROCm、不同模型上会得出不同结果。
+# 核心思路：只有当相应的 custom op（手写的融合算子）真的被启用时才开这个 pass，
+# 否则交给 Inductor 在编译期自己融合，避免重复优化。
 
 
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
@@ -165,6 +226,10 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
+# 把"张量并行 all-reduce"与后面的 RMSNorm 合成一个 kernel，省一次全局同步与显存往返。
+# 前提很苛刻：必须真的有多卡（TP>1），且是 CUDA 上的 Hopper(90)/Blackwell(100) 家族，
+# 并装了 flashinfer；ROCm 走 AITER 的等价路径。
+# 另外它破坏了 batch-invariance（结果随 batch 组成变化），因此该模式下一律关闭。
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
     from vllm.platforms import current_platform
@@ -192,6 +257,15 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
+# 下面四个是 ROCm/AITER 专属的融合开关，目标都是同一件事：
+# 把「RoPE 位置编码 → 写 KV Cache」这一串小算子合成一个 kernel，减少访存往返。
+# 共同前提是 AITER 算子库已启用；差别在于各自还要满足的额外条件：
+#   - enable_rope_kvcache_fusion      : 还要 rotary_embedding custom op 生效
+#   - enable_rope_kvcache_mla_fusion  : 只要求图切分方式允许（MLA 路径）
+#   - enable_mla_dual_rms_norm_fusion : 仅 AITER 即可（MLA 的双 RMSNorm）
+#   - enable_qk_norm_rope_kvcache     : 再把 QK-Norm 也并进来
+# "use_inductor_graph_partition or not splitting_ops_contain_kv_cache_update()"
+# 这个判据反复出现，含义是：只要没有被拆分算子把 KV 更新切到图外，就可以安全融合。
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
@@ -243,6 +317,15 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+# 【优化等级默认表】四个字典分别对应 -O0..-O3，结构是"嵌套的配置字段路径 → 默认值"。
+# 键是子配置名（如 "compilation_config"），值是它的字段字典，可继续嵌套到 pass_config。
+# 值有两种形态：
+#   1) 直接量（True/False/CUDAGraphMode.XXX）——写死，所有平台一致；
+#   2) callable（enable_*_fusion 等）——延后到配置装配时传入 VllmConfig 求值。
+# 重要：这些只是"默认值"，只作用于用户没有显式指定的字段（见 _apply_optimization_level_defaults）。
+# 所以 -O2 里 fuse_allreduce_rms 写的是 enable_allreduce_rms_fusion，在单卡上求值为 False。
+# 各等级递进关系：O0 全关（启动最快）→ O1 开编译+piecewise cudagraph →
+# O2 再加 full cudagraph 与更多融合（默认）→ O3 目前与 O2 相同。
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -344,6 +427,22 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 }
 
 
+# 【VllmConfig：全项目唯一的"配置根对象"】
+# 它是一个 pydantic dataclass（@config 装饰器见 .utils.config），把十几个子配置聚合在一起，
+# 目的只有一个：让代码各处只需传递这一个对象，而不用传一堆互相耦合的配置。
+#
+# 字段分三类，判断依据是"默认值形态"：
+#   1) 必填无默认：只有 model_config（构造空 ModelConfig 会触发下载，所以不能给 default_factory）
+#   2) 默认实例：cache/parallel/scheduler/device/load/compilation/kernel/attention/mamba/
+#      structured_outputs/observability/ec_manager/offload 等，用 Field(default_factory=...)
+#      —— 每次构造都新建实例，避免多个 VllmConfig 共享同一份可变子配置。
+#      注意 scheduler_config 用的是 SchedulerConfig.default_factory（自定义工厂），
+#      因为它需要根据其他信息推导默认值，不是简单的无参构造。
+#   3) 默认 None：lora/speculative/diffusion/quant/kv_transfer/kv_events/ec_transfer/
+#      reasoning/weight_transfer —— None 语义是"该特性未启用"，不是"用默认值"。
+#
+# 生命周期：进程启动时装配一次 → __post_init__ 做跨配置校验与默认值推导（会就地改写子配置）
+#          → 之后全程只读。调试时请以"最终对象"为准，而不是你传入的参数。
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
@@ -445,6 +544,15 @@ class VllmConfig:
     remaining requests are aborted once the timeout is reached.
     """
 
+    # 【配置指纹】把"会影响计算图结构"的所有配置收集成列表，序列化后取哈希前 10 位。
+    # 用途：torch.compile 的缓存 key、CUDA Graph 缓存目录名、prefix caching 的编译复用判断。
+    # 关键约束（也是最容易踩的坑）：
+    #   - 只覆盖"从 input_ids/embeddings 到最终 hidden states"这一段的计算图。
+    #     采样、detokenize、日志等图外行为不进哈希，改它们不应导致重编译。
+    #   - 新增字段时，如果它影响计算图，必须加进 factors，否则会命中错误的旧缓存。
+    #   - 每个子配置各自实现 compute_hash()，这里只负责聚合（见 .utils.SupportsHash）。
+    #   - quant_config 故意不加：它已经被 model_config.quantization 覆盖，避免重复。
+    #   - additional_config 是 dict 时用 json.dumps(sort_keys=True) 归一化，保证键顺序不影响结果。
     def compute_hash(self, include_version: bool = True) -> str:
         """
         WARNING: Whenever a new field is added to this config,

@@ -1,6 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# ============================================================
+# [CN] 文件：vllm/entrypoints/offline_utils.py
+# 职责：离线推理的通用执行层——请求预处理、批量入队、同步 step 循环
+# 位置：LLM.generate/chat → 【本文件】→ LLMEngine.add_request / step
+# 核心成员：OfflineInferenceMixin（唯一类）
+# 上游：vllm/entrypoints/llm.py 的 LLM、BeamSearchOfflineMixin、PoolingOfflineMixin
+# 下游：vllm/v1/engine/llm_engine.py 的 LLMEngine
+# 关键概念：mixin 模式、渲染即提交（生成器流水线）、FINAL_ONLY 输出、按 request_id 排序
+# 状态：☑ 通读  ☑ 注释完成  □ 已验证
+# ============================================================
+#
+# 【本文件在链路中的位置】llm.py 的 LLM 只是「门面」，真正干活的是这里：
+#   LLM.generate()
+#     → _run_completion()          （本文件）
+#     → _add_completion_requests() （本文件：渲染 + 逐个入队）
+#     → _render_and_add_requests() （本文件：循环调用 _add_request）
+#     → _run_engine()              （本文件：while 循环 step）
+#     → LLMEngine.add_request / step
+# 也就是说，离线推理的「批处理语义」全部定义在这一个文件里。
+#
+# 【为什么用 mixin 而不是继承】OfflineInferenceMixin 只提供方法，不持有状态。
+# 它需要的 request_counter / renderer / llm_engine / model_config 都在类体内
+# 「只声明类型、不赋值」，由混入它的类（LLM）在 __init__ 里填充。
+# 好处：PoolingOfflineMixin、BeamSearchOfflineMixin 也能复用同一套入队与 step 逻辑，
+# 不需要各自复制一遍。代价是单独看本文件无法确定这些属性从哪来。
+#
+# 【本文件的三个核心设计，理解了就理解了离线推理】
+# 1. 渲染与提交用生成器串起来：prompt 逐个渲染、逐个提交，
+#    于是「第一个请求开始执行」不必等到「最后一个渲染完」（见 _render_and_run_requests）。
+# 2. 输出只要最终结果：_add_request 里强制 output_kind = FINAL_ONLY，
+#    离线不需要在线那种逐步吐字的增量输出。
+# 3. 返回前按 request_id 排序：保证输出顺序 == 提交顺序，
+#    而不是完成顺序（见 _run_engine 末尾）。
+
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -38,6 +72,12 @@ from vllm.v1.engine.llm_engine import LLMEngine
 logger = init_logger(__name__)
 
 
+# [CN] 三个 TypeVar 的作用（PEP 696 的 default 是较新语法）：
+# - _P：参数类型，只能是 SamplingParams 或 PoolingParams 或 None。
+#   bound 的意义：generate 用 SamplingParams、embed 用 PoolingParams，
+#   用同一个 _P 就能让「传什么类型的参数，就返回什么类型的输出」这件事被类型检查器追踪。
+# - _O：输出类型，default 表示调用时不显式指定就用默认联合类型。
+# - _R：任意返回类型，供 collective_rpc 等通用方法使用。
 _P = TypeVar("_P", bound=SamplingParams | PoolingParams | None)
 _O = TypeVar(
     "_O",
@@ -47,19 +87,39 @@ _O = TypeVar(
 _R = TypeVar("_R", default=Any)
 
 
+# [CN] 离线推理的公共实现，以 mixin 形式提供（类名里的 Mixin 就是这个意思）。
+# 它不独立实例化，而是被 LLM 等多个类继承（见 llm.py 里 LLM 的基类列表）。
 class OfflineInferenceMixin:
     """Offline inference utils"""
 
+    # [CN] 下面四行是「只有类型标注、没有赋值」的类属性声明。
+    # 它们不是默认值，运行时访问前必须由混入方的 __init__ 赋值，否则 AttributeError。
+    # 这样写的用途有两个：
+    # 1. 让类型检查器和 IDE 知道这些属性的类型，在本文件内使用时能补全和检查；
+    # 2. 明确声明「本 mixin 依赖宿主提供什么」，相当于一份口头契约。
+    # 真正赋值的位置是 vllm/entrypoints/llm.py 的 LLM.__init__。
     request_counter: Counter
     renderer: BaseRenderer
     llm_engine: "LLMEngine"
     model_config: ModelConfig
 
+    # [CN] 解析「按模态自动挂载的 LoRA」。
+    # 背景：vLLM 支持为不同模态（image / audio / video）各注册一个默认 LoRA，
+    # 配置在 lora_config.default_mm_loras。这样多模态请求不必每次手动传 LoRA。
+    #
+    # 返回值规则（优先级从高到低）：
+    # 1. 显式传入的 lora_request —— 永远优先，自动推断的不会覆盖它；
+    # 2. 按 prompt 实际包含的模态推断出的默认 LoRA；
+    # 3. 都没有则原样返回 None。
+    #
+    # 限制：一个请求只能挂一个 LoRA。因此「一个 prompt 同时命中多个模态的 LoRA」
+    # 时只能放弃自动挂载并告警（下面的 len(intersection) > 1 分支）。
     def _resolve_mm_lora(
         self,
         prompt: EngineInput,
         lora_request: LoRARequest | None,
     ) -> LoRARequest | None:
+        # [CN] 非多模态请求没有「模态」概念，直接短路返回。
         if prompt["type"] != "multimodal":
             return lora_request
 
@@ -86,6 +146,9 @@ class OfflineInferenceMixin:
 
         # Build the LoRA request; the ID of the default mm lora is the
         # index of the modality name sorted alphabetically + 1.
+        # [CN] LoRA 的 int id 由「模态名按字典序排序后的下标 + 1」决定，
+        # 而不是随请求分配。这样做是为了让同一个模态在不同请求里得到稳定相同的 id，
+        # 引擎侧才能据此复用已加载的适配器。+1 是为了避开 0（0 通常保留给「无 LoRA」）。
         modality_name = intersection.pop()
         modality_lora_path = default_mm_loras[modality_name]
         modality_lora_id = sorted(default_mm_loras).index(modality_name) + 1
@@ -122,12 +185,21 @@ class OfflineInferenceMixin:
         Returns:
             A list of `EngineInput` objects ready to be passed into LLMEngine.
         """
+        # [CN] 预处理分两步，顺序不能反：
+        # 1. parse_model_prompt：先把用户给的 PromptType（字符串 / token 列表 /
+        #    TextPrompt / TokensPrompt 等多种形态）解析成统一的内部结构，
+        #    并处理「纯文本」与「带多模态内容」两种情形的区分。
+        # 2. renderer.render_cmpl：再真正做分词与多模态处理，产出 EngineInput。
+        # 拆开的意义：解析是纯结构操作、与模型无关；渲染要用到分词器和处理器。
         renderer = self.renderer
         model_config = self.model_config
 
         parsed_prompts = [
             parse_model_prompt(model_config, prompt) for prompt in prompts
         ]
+        # [CN] with_kwargs 是「在默认参数基础上叠加覆盖项」的写法：
+        # 默认分词参数来自 renderer，用户传的 tokenization_kwargs 覆盖同名字段。
+        # 注意只影响分词阶段，不影响采样。
         tok_params = renderer.default_cmpl_tok_params.with_kwargs(
             **(tokenization_kwargs or {})
         )
@@ -201,6 +273,13 @@ class OfflineInferenceMixin:
         # matches the online chat API (`ChatCompletionRequest.add_special_tokens`
         # defaults to `False`) and avoids a double BOS for multimodal models,
         # whose processor default is `add_special_tokens=True` (#55197).
+        # [CN] 这段是离线 chat 最容易踩的坑之一，值得展开：
+        # 聊天模板本身已经把 BOS/EOS 写进渲染结果里了，如果再让分词器加一次，
+        # 就会出现「双 BOS」——模型输入前面多一个特殊 token，影响输出质量。
+        # 所以这里默认 add_special_tokens=False。
+        # 那为什么多模态模型尤其危险？因为多模态 processor 的默认值是 True，
+        # 不显式关掉就会中招（对应 issue #55197）。
+        # 字典展开顺序是 `{默认, **用户传入}`，因此用户显式指定的值可以覆盖这里的默认。
         tokenization_kwargs = {
             "add_special_tokens": False,
             **(tokenization_kwargs or {}),
@@ -247,6 +326,18 @@ class OfflineInferenceMixin:
 
         return engine_input
 
+    # [CN] 三个 _xxx_to_seq 是同一套模式，合起来看：
+    # 「单个值 → 复制成 N 份的序列；已经是序列 → 校验长度后原样返回」。
+    # 这样下游就能统一按索引 pairs 处理，不必到处判断「是一个还是多个」。
+    #
+    # 两个要注意的细节：
+    # 1. 用 `isinstance(x, Sequence)` 判断「是不是序列」，靠的是 SamplingParams /
+    #    LoRARequest 本身不是 Sequence 类型。如果将来这些类实现了 __len__/__getitem__，
+    #    这里会误判——属于依赖类型事实的隐式约定。
+    # 2. 复制用的是 `[params] * n`，即**同一个对象的 N 个引用**，不是 N 份深拷贝。
+    #    因此下游若原地修改其中某个 params（见 _add_request 里的 output_kind 赋值），
+    #    所有请求都会受影响。这在离线场景是期望行为（参数本就一致），
+    #    但复用同一个 SamplingParams 对象跨多次调用时要小心。
     def _params_to_seq(
         self,
         params: _P | Sequence[_P],
@@ -429,6 +520,11 @@ class OfflineInferenceMixin:
         # <|channel>, <|tool_call>, <|"|>), automatically set
         # skip_special_tokens=False so these tokens are preserved in
         # output.text for downstream parsing.
+        # [CN] 为什么开了 thinking 或传了 tools 就要特殊处理：
+        # 部分模型（这里是 Gemma4）把「思考段落分隔符」「工具调用标记」注册成了
+        # 特殊 token。而分词时默认 skip_special_tokens=True，会把它们从 output.text
+        # 里剥掉——结果就是下游拿不到分隔符，没法切分思考内容和工具调用，解析直接坏掉。
+        # 所以要在提交前把 skip_special_tokens 改回 False（见 _adjust_params_for_parsing）。
         needs_parsing = (
             chat_template_kwargs and chat_template_kwargs.get("enable_thinking")
         ) or tools
@@ -516,6 +612,12 @@ class OfflineInferenceMixin:
         priorities: Sequence[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
     ):
+        # [CN] 为什么传 list/tuple 要告警：这是本文件最重要的性能提示。
+        # prompts 是「已经全部渲染好的列表」时，必须先渲染完所有请求才能开始提交，
+        # 也就是引擎在整个渲染期间完全空闲。
+        # 反之如果传生成器（_add_completion_requests 里就是这么做的），
+        # 每渲染好一个就立刻提交，引擎可以在渲染第二个的时候就开始执行第一个——
+        # 渲染与执行形成流水线。大批量、多模态（渲染很慢）时差距非常明显。
         if isinstance(prompts, (list, tuple)):
             logger.warning_once(
                 "Rendering all prompts before adding them to the engine "
@@ -543,6 +645,9 @@ class OfflineInferenceMixin:
         lora_requests: Sequence[LoRARequest | None] | None = None,
         priorities: Sequence[int] | None = None,
     ) -> list[str]:
+        # [CN] 边遍历边提交：prompts 通常是生成器，因此这里是「渲染一个、提交一个」。
+        # 注意 enumerate 的下标 i 同时用于取 params / lora / priority，
+        # 三者必须与 prompts 等长——长度校验在各自的 _xxx_to_seq 里做过。
         added_request_ids: list[str] = []
 
         try:
@@ -558,6 +663,10 @@ class OfflineInferenceMixin:
                 )
                 added_request_ids.append(request_id)
         except Exception as e:
+            # [CN] 失败回滚：中途抛异常时，本次已经成功入队的请求如果不撤销，
+            # 会一直留在引擎里占着 KV cache，而调用方永远拿不到结果也不会再来取。
+            # 所以这里显式 abort 掉本次调用已添加的全部请求，再向上抛原异常。
+            # 用 internal=True 表示这是内部发起的中止，区别于用户主动取消。
             if added_request_ids:
                 self.llm_engine.abort_request(added_request_ids, internal=True)
             raise e
@@ -571,10 +680,23 @@ class OfflineInferenceMixin:
         lora_request: LoRARequest | None = None,
         priority: int = 0,
     ) -> str:
+        # [CN] 强制只输出最终结果。这是离线与在线最核心的一个差异：
+        # 在线要逐 token 吐给客户端，输出 kind 是 DELTA（增量）；
+        # 离线一次拿到完整结果即可，用 FINAL_ONLY 省掉中间增量输出的构造与传输开销。
+        #
+        # 注意这里是**原地修改**传入的 params 对象（不是拷贝）。
+        # 结合 _params_to_seq 里 `[params] * n` 的共享引用，
+        # 意味着调用方传入的同一个 SamplingParams 实例会被改写 output_kind。
+        # 复用参数对象时（比如同一个 params 先传给 generate 再看它的字段）要留意。
+        #
+        # 只对 SamplingParams 生效：PoolingParams 没有采样过程，也就没有输出粒度概念。
         if isinstance(params, SamplingParams):
             # We only care about the final output
             params.output_kind = RequestOutputKind.FINAL_ONLY
 
+        # [CN] 请求 ID 就是自增计数器的字符串形式。
+        # 它只在本进程内唯一——跨进程/多实例场景各自独立计数，不保证全局唯一。
+        # 末尾 _run_engine 依赖它是整数可解析的（int(x.request_id)）来排序。
         request_id = str(next(self.request_counter))
 
         return self.llm_engine.add_request(
@@ -603,13 +725,23 @@ class OfflineInferenceMixin:
             )
 
         # Run the engine.
+        # [CN] 【离线推理的主循环】不断调用引擎 step()，直到没有未完成请求。
+        # 每一次 step() 就是引擎推进「一个批次的一步」：调度 → 模型 forward → 采样 → 更新状态。
+        # 因此这个 while 循环的次数 ≈ 总 decode 步数，而不是请求数。
+        #
+        # 注意它是**同步阻塞**的：整个 generate() 期间主线程都在这里转，
+        # 这也是离线 API 不能用于在线服务的根本原因。
         outputs: list[_O] = []
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
+                # [CN] output_type 就是调用方声明的期望类型（RequestOutput 等）。
+                # 这条 assert 兼作过滤：混入预期之外的输出类型时直接暴露，而不是静默返回。
                 assert isinstance(output, output_type)
+                # [CN] 只收集已完成的输出。因为 output_kind=FINAL_ONLY，
+                # 每个请求在其最终结果产生时才会出现在这里一次。
                 if output.finished:
                     outputs.append(output)  # type: ignore[arg-type]
                     if use_tqdm:
@@ -638,4 +770,9 @@ class OfflineInferenceMixin:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+        # [CN] 按 request_id 的数值升序排序后返回。
+        # 为什么必须排：请求是并发执行的，短请求会先完成，
+        # 直接按完成顺序收集会导致输出顺序与输入顺序不对应。
+        # 排序后「第 i 个输出」严格对应「用户传入的第 i 个 prompt」，
+        # 调用方可以放心用下标对齐，这也是 LLM.generate 文档承诺的行为。
         return sorted(outputs, key=lambda x: int(x.request_id))

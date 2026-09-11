@@ -43,22 +43,34 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
+# [CN] BlockHash：一个 KV cache 块的哈希值，用于**前缀缓存**。
+#      用 NewType 而不是裸 bytes，是为了让类型检查器能抓到
+#      "把普通字节串当块哈希传"这类误用。
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
 # catch accidental misuse when passing around raw byte strings.
 BlockHash = NewType("BlockHash", bytes)
 
+# [CN] 带上 **group id** 的块哈希 = 实际的缓存键。
+#      为什么必须带 group id：不同 KV cache group 的块内容不同
+#      （比如 full attention 与 sliding window），同一个 token 前缀
+#      在不同 group 里算出的 KV 也不同，必须分开索引。
+#      实现上直接把 group id 以 4 字节大端**拼在哈希后面**，
+#      而不是用 tuple —— 省掉一次对象分配（热路径上的常见优化）。
 # `BlockHashWithGroupId` combines a `BlockHash` with its KV cache group ID.
 # It is represented as raw bytes for compactness and efficiency. The helper
 # functions below pack/unpack the `BlockHash` and group id into/from the key.
 BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 
+# [CN] 对外暴露（KV 事件）时用的哈希形式：bytes 或 int 的联合，
+#      保留 int 是为了兼容早期版本的消费方。
 # ExternalBlockHash is used for reproducible prefix-cache block hashing.
 # It's a union of `bytes` and `int` to keep backward compatibility
 # after we default block hashing to use sha256 bytes.
 ExternalBlockHash: TypeAlias = bytes | int
 
 
+# [CN] 打包：hash + group_id 的 4 字节大端表示。
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int
 ) -> BlockHashWithGroupId:
@@ -81,6 +93,7 @@ def get_group_id(key: BlockHashWithGroupId) -> int:
     return int.from_bytes(key[-4:], "big", signed=False)
 
 
+# [CN] 按环境变量决定对外发 bytes 还是 int（后者取低 64 位）。
 def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
     if not envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES:
         return hash_bytes
@@ -89,6 +102,15 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+# [CN] NONE_HASH 是**前缀链起点**的哈希（第一个块的"父哈希"）。
+#      这段长注释讲了一个很实际的安全/可复现权衡：
+#        - 加密哈希（sha256）：用**固定种子**，因此不同进程、不同节点
+#          算出的块哈希完全一致，可以跨实例共享前缀缓存；
+#          碰撞安全性不依赖种子保密，所以这样做是安全的。
+#        - 非加密哈希（xxhash）：必须用**每进程随机种子**，
+#          否则攻击者可以离线预构造碰撞块（见 issue #12621）。
+#          代价是块哈希不可复现，跨进程无法复用。
+#      想跨实例复用就用 sha256，或设置 PYTHONHASHSEED。
 # The hash seed for the first block of any prefix block sequence.
 #
 # For cryptographic hash algorithms it is derived deterministically from a fixed
@@ -116,6 +138,8 @@ _NON_CRYPTO_HASH_FUNCTIONS = frozenset({xxhash, xxhash_cbor})
 _NONE_HASH_SEED: str | None = None
 
 
+# [CN] 决定种子：PYTHONHASHSEED 优先；否则加密哈希用固定值，
+#      非加密哈希用随机值。
 def resolve_none_hash_seed(hash_fn: Callable[[Any], bytes]) -> str:
     """Resolve the seed to derive NONE_HASH from.
 
@@ -132,6 +156,8 @@ def resolve_none_hash_seed(hash_fn: Callable[[Any], bytes]) -> str:
     return DEFAULT_NONE_HASH_SEED
 
 
+# [CN] 把**已解析出来的种子**暴露出去，而不是让别处重新推导 ——
+#      否则随机种子那一路别的组件拿不到，P2P 握手就会对不上。
 def get_none_hash_seed() -> str:
     """Return the seed NONE_HASH was derived from.
 
@@ -145,6 +171,7 @@ def get_none_hash_seed() -> str:
     return _NONE_HASH_SEED
 
 
+# [CN] 全局初始化 NONE_HASH（进程启动时调用一次）。
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
     global NONE_HASH, _NONE_HASH_SEED
 
@@ -160,26 +187,37 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
     NONE_HASH = BlockHash(hash_fn(_NONE_HASH_SEED))
 
 
+# [CN] **一个 KV cache 块的元数据**（不是数据本身，数据在 GPU 上）。
+#      @dataclass(slots=True)：块的数量可能有几十万个，
+#      用 slots 去掉 per-instance __dict__ 能省一大笔内存。
 @dataclass(slots=True)
 class KVCacheBlock:
     """KV-cache block metadata."""
 
+    # [CN] 块 id，范围 [0, num_gpu_blocks)。它**就是** GPU 上那块内存的索引。
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    # [CN] **引用计数**。0 表示在空闲队列（可被分配/淘汰），
+    #      >0 表示被若干请求共享（前缀复用）。
     # Reference count.
     ref_cnt: int = 0
+    # [CN] 本块的缓存键（含 group id）。只有"写满且已缓存"的块才有。
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
+    # [CN] _block_hash 覆盖的前缀 token 数。
+    #      对完整块 = 块边界；对 partial 条目则可能落在块内部。
     # Number of prefix tokens covered by _block_hash. For full blocks this is
     # the full block boundary; partial entries can end inside a cache block.
     _block_hash_num_tokens: int | None = None
 
+    # [CN] 空闲块**双向链表**的指针。约定：只能由 FreeKVCacheBlockQueue 改。
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
 
+    # [CN] null block 标记（占位块，永不缓存、不参与引用计数）。
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
@@ -191,6 +229,7 @@ class KVCacheBlock:
     def block_hash_num_tokens(self) -> int | None:
         return self._block_hash_num_tokens
 
+    # [CN] 设置哈希。assert 卡住重复设置 —— 保证"一个块只有一个主哈希"。
     def set_block_hash(
         self,
         block_hash: BlockHashWithGroupId,
@@ -202,11 +241,13 @@ class KVCacheBlock:
         self._block_hash = block_hash
         self._block_hash_num_tokens = num_tokens
 
+    # [CN] 淘汰/复用时清空哈希。
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
 
+    # [CN] repr 里只打印**相邻块的 id**而不是块对象，否则会递归打印整条链表。
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
         # on KVCacheBlock object recursively.
@@ -222,11 +263,21 @@ class KVCacheBlock:
         )
 
 
+# [CN] 一次 **CoW 拷贝** 的描述（源块 -> 目标块），随 SchedulerOutput 下发。
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
 
 
+# [CN] **空闲块双向链表**。为什么不用 collections.deque？
+#      因为需要 O(1) 删除**链表中间的任意块**（前缀命中时要把块
+#      从淘汰候选里摘出来），而 deque 的 remove 是 O(n)。
+#      为了逼近 C++ deque 的性能，这个类**不分配任何 Python 对象**：
+#      链表指针直接存在块自身的 prev/next 字段里（侵入式链表）。
+#
+#      队列顺序 = 淘汰顺序：队头最久未用（LRU），先被淘汰。
+#      注意最后一句："释放时反转顺序"的动作在 BlockPool 里做，
+#      不在这个类里。
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -249,6 +300,7 @@ class FreeKVCacheBlockQueue:
         blocks: A list of KVCacheBlock objects.
     """
 
+    # [CN] 把传入的所有块按顺序串成双向链表。O(n) 一次性建好。
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
 
@@ -259,6 +311,8 @@ class FreeKVCacheBlockQueue:
             if i < self.num_free_blocks - 1:
                 blocks[i].next_free_block = blocks[i + 1]
 
+        # [CN] **哨兵头/尾节点**：有了它们，插入删除就不用判断"是不是头/尾"，
+        #      既少分支又快。约定：这两个哨兵永远不会被弹出。
         # Create a fake head and a tail block for the doubly linked list to
         # reduce branching in the code
         #
@@ -279,6 +333,7 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+    # [CN] 弹出队头（= 最该被淘汰的块）。
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
 
@@ -316,6 +371,7 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks -= 1
         return first_block
 
+    # [CN] 一次弹出 n 个：只在**最后**接一次链表，比调 n 次 popleft 快。
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop the first n free blocks and reduce num_free_blocks by n.
 
@@ -349,6 +405,7 @@ class FreeKVCacheBlockQueue:
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
+    # [CN] O(1) 摘掉链表中间的块（deque 做不到，这正是本类存在的理由）。
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
@@ -369,6 +426,7 @@ class FreeKVCacheBlockQueue:
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
 
+    # [CN] 追加到队尾（= 最不容易被淘汰）。
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
         num_free_blocks by 1.
@@ -392,6 +450,7 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += 1
 
+    # [CN] 批量插到队头（无缓存块的 LIFO 复用，见 BlockPool.free_blocks）。
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks at the front of the free list."""
         if len(blocks) == 0:
@@ -413,6 +472,7 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    # [CN] 批量追加到队尾（有缓存块的 FIFO，形成 LRU 顺序）。
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
 
@@ -458,6 +518,7 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
         return ret
 
+    # [CN] 从某个游标之后按淘汰顺序迭代（供外部增量扫描空闲块用）。
     def iter_blocks_after(
         self,
         cursor: KVCacheBlock | None,
@@ -473,6 +534,10 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
 
 
+# [CN] 生成多模态相关的**额外哈希键**。
+#      为什么需要：两个请求可能 prompt token 完全一样，但一张是猫、
+#      一张是狗 —— 如果只哈希 token id 就会错误地命中缓存。
+#      所以要把"这块里包含哪些多模态输入、以及在块内的偏移"也纳入哈希。
 def _gen_mm_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[list[Any], int]:
@@ -496,6 +561,9 @@ def _gen_mm_extra_hash_keys(
     if not mm_features:
         return extra_keys, start_mm_idx
 
+    # [CN] 前提：mm_features 已按 offset 排序。
+    #      这个早退很有效：解码阶段绝大多数块都在所有多模态输入之后，
+    #      直接返回，不用遍历。
     # Note that we assume mm_features are sorted by mm_position.offset.
     # We do not need to check all mm inputs if the start token index is out of
     # range. This usually happens in the late prefill phase and decoding phase.
@@ -503,6 +571,8 @@ def _gen_mm_extra_hash_keys(
     if last_pos.offset + last_pos.length <= start_token_idx:
         return extra_keys, start_mm_idx
 
+    # [CN] start_mm_idx = -1 表示"最后一个多模态输入"，
+    #      这是解码阶段（新块由生成 token 填满）的常见情形。
     # Support start_mm_idx == -1 to indicate the last mm input.
     if start_mm_idx < 0:
         assert -start_mm_idx <= len(mm_features)
@@ -520,6 +590,9 @@ def _gen_mm_extra_hash_keys(
                 curr_mm_idx += 1
                 continue
 
+            # [CN] 关键点：把 **mm 输入相对块起点的偏移** 也放进哈希。
+            #      否则同一个图片占位符出现在块内不同位置时，
+            #      会产生相同的哈希 —— 但它们的 KV 其实不同。
             # The block contains the current mm input. Include its offset
             # relative to the start of the block so prefix-cache keys stay
             # distinct when the same MM item appears at different positions
@@ -540,6 +613,8 @@ def _gen_mm_extra_hash_keys(
     return extra_keys, curr_mm_idx
 
 
+# [CN] LoRA 相关的额外键：**用 LoRA 名字**（不是 id），
+#      因为同一个 id 在不同部署里可能指向不同权重，名字更稳。
 def _gen_lora_extra_hash_keys(request: Request) -> list[str]:
     """Generate extra keys related to LoRA for block hash computation.
 
@@ -555,6 +630,8 @@ def _gen_lora_extra_hash_keys(request: Request) -> list[str]:
     return [request.lora_request.lora_name]
 
 
+# [CN] prompt_embeds 的额外键：对张量做 sha256，
+#      并且**按 block 区间缓存**在请求上（避免每步重复算）。
 def _gen_prompt_embeds_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int
 ) -> list[bytes]:
@@ -581,6 +658,8 @@ def _gen_prompt_embeds_extra_hash_keys(
     return [embeds_hash]
 
 
+# [CN] 汇总三类额外键：LoRA + 多模态 + cache_salt + prompt embeds。
+#      没有额外键时返回 None（让 hash 输入保持最简，省算力）。
 def generate_block_hash_extra_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[tuple[Any, ...] | None, int]:
@@ -602,6 +681,9 @@ def generate_block_hash_extra_keys(
         request, start_token_idx, end_token_idx, start_mm_idx
     )
     lora_extra_keys: list[str] = _gen_lora_extra_hash_keys(request)
+    # [CN] cache_salt 只加在**第一个块**上：
+    #      它用于人为隔离缓存（比如多租户），只需在链起点生效一次，
+    #      后续块因为链式哈希会自然继承差异。
     cache_salt_keys: list[str] = (
         [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []
     )
@@ -619,6 +701,11 @@ def generate_block_hash_extra_keys(
     return tuple(extra_keys), new_start_mm_idx
 
 
+# [CN] **计算一个块的哈希**。核心是：hash(父哈希, 本块 token, 额外键)。
+#      这就是所谓的**链式哈希**：每个块的哈希都隐含了它之前的全部内容，
+#      于是"两个块哈希相等"就等价于"它们的完整前缀相同" ——
+#      这正是前缀缓存能只比一个哈希就判定命中的原因。
+#      注意它被 lru_cache 包过（同内容不重复计算）。
 def hash_block_tokens(
     hash_function: Callable[[Any], bytes],
     parent_block_hash: BlockHash | None,
@@ -640,6 +727,7 @@ def hash_block_tokens(
         The hash value of the block and the token ids in the block.
         The entire tuple is used as the hash key of the block.
     """
+    # [CN] 第一个块没有父，用 NONE_HASH 作为链的起点。
     if not parent_block_hash:
         parent_block_hash = NONE_HASH
 
@@ -649,6 +737,8 @@ def hash_block_tokens(
     )
 
 
+# [CN] DCP（decode context parallel）下，注意力的 KV 是按上下文**切分**的，
+#      所以一个"逻辑块"实际横跨 dcp_world_size 个物理块的 token 跨度。
 def resolve_dcp_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
     """Return the token span of a cache block under DCP."""
     layer_specs = iter_layer_specs(spec)
@@ -676,6 +766,10 @@ def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCache
     return replace(spec, block_size=block_size)
 
 
+# [CN] 哪些 spec 受 DCP 影响、哪些不受 —— 这段 docstring 讲得很清楚：
+#      全注意力（含 MLA）会被分片，所以块几何要乘 DCP；
+#      而 Mamba / 滑窗 / 分块局部注意力保存的是**每 rank 各自完整**的状态，
+#      即使进程开了 DCP，它们也必须按 dcp=1 计算。
 def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> int:
     """Return the DCP size that owns this group's block geometry.
 
@@ -698,6 +792,12 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     return 1
 
 
+# [CN] 解析出两个关键尺寸（**很容易混淆，务必分清**）：
+#        scheduler_block_size：调度器用的 token 对齐粒度
+#        hash_block_size     ：计算块哈希的粒度（前缀匹配的最小单位）
+#      单 group 时两者相同；多 group 时前者取**最小公倍数**（LCM，
+#      保证对所有 group 都对齐），后者取**最大公约数**（GCD，
+#      让前缀匹配尽可能细）。
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -727,15 +827,20 @@ def resolve_kv_cache_block_sizes(
     group_block_sizes = [
         resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
+    # [CN] 多 group：调度粒度取 LCM —— 因为 num_computed_tokens 之类的量
+    #      必须对所有 group 同时对齐，取整到公倍数才安全。
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
     # (P/D, offloading); when neither is active, keep hash_block_size equal
     # to the scheduler block size.
+    # [CN] 只有前缀缓存或 KV connector 开启时才需要细粒度哈希；
+    #      都没开就让 hash_block_size 等于 scheduler 块大小（省算力）。
     connector_enabled = vllm_config.kv_transfer_config is not None
     if not (cache_config.enable_prefix_caching or connector_enabled):
         return scheduler_block_size, scheduler_block_size
 
+    # [CN] 非 align 模式的 Mamba 组会破坏整除性，只能回退到粗粒度。
     # Mamba groups outside align mode break divisibility; back off to the
     # scheduler block size. Read the mode from the resolved group spec because
     # its block size may have been updated independently of cache_config.
@@ -746,6 +851,8 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    # [CN] 只对**可前缀缓存**的 group 求 GCD；用户可通过
+    #      prefix_match_unit 手工指定（更可控但需自行保证整除）。
     hashing_sizes = [
         block_size
         for group, block_size in zip(groups, group_block_sizes)
@@ -768,6 +875,8 @@ def resolve_kv_cache_block_sizes(
         and isinstance(spec.tokens_per_state, int)
         and spec.tokens_per_state > 1
     }
+    # [CN] Mamba 的 align 模式允许"块内部分边界"复用，
+    #      此时命中对齐粒度要用 hash_block_size 而不是整块。
     has_partial_mamba_group = any(
         isinstance(spec, MambaSpec)
         and spec.mamba_cache_mode == "align"
@@ -790,6 +899,8 @@ def resolve_kv_cache_block_sizes(
     return scheduler_block_size, hash_block_size
 
 
+# [CN] 返回一个"给请求计算新块哈希"的函数（闭包捕获 hash_block_size）。
+#      设计成工厂是因为块大小在启动期才确定。
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
@@ -804,15 +915,21 @@ def get_request_block_hasher(
     these hashes directly (see ``BlockHashListWithBlockSize``).
     """
 
+    # [CN] **增量**计算：只算上次之后新填满的块，老的哈希复用。
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens
 
+        # [CN] 没有新填满的块就直接返回（解码每一步只生成一个 token，
+        #      绝大多数调用都会在这个早退返回 —— 这是热路径）。
         if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
 
         curr_mm_idx = 0
+        # [CN] 非首块时用 -1（表示"只看最后一个多模态输入"）：
+        #      因为能走到这里的块必然是由**生成 token** 填满的，
+        #      不可能引入新的多模态输入。
         if start_token_idx > 0:
             # Set curr_mm_idx = -1 to indicate the last mm input.
             # Note that since we reach to this branch only when the block is
@@ -850,6 +967,8 @@ def get_request_block_hasher(
     return request_block_hasher
 
 
+# [CN] 显存不够时的报错：除了报错还会**估算**"这个显存大概能跑多长"，
+#      比干巴巴一句 OOM 有用得多（用户可以直接照着调 max_model_len）。
 def _check_enough_kv_cache_memory(
     available_memory: int,
     get_needed_memory: Callable[[], int],
@@ -890,6 +1009,7 @@ def _check_enough_kv_cache_memory(
         )
 
 
+# [CN] 所有 spec 的最大内存占用之和。
 def max_memory_usage_bytes(
     vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
 ) -> int:
@@ -899,6 +1019,9 @@ def max_memory_usage_bytes(
     return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
 
 
+# [CN] **二分查找**估算"给定显存最多能跑多长的序列"。
+#      注意它临时改 max_model_len、用完在 finally 里恢复 ——
+#      借用了"修改配置 -> 复用现成计算"的偷懒做法，但保证了无副作用。
 def estimate_max_model_len(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -923,6 +1046,7 @@ def estimate_max_model_len(
     original_max_model_len = vllm_config.model_config.max_model_len
 
     # Define a function to check if a given model length fits in memory
+        # [CN] 把 model_len 临时塞进 config，复用 max_memory_usage_bytes 来估算。
     def fits_in_memory(model_len: int) -> bool:
         # Temporarily modify the max_model_len for this calculation
         vllm_config.model_config.max_model_len = model_len
@@ -948,11 +1072,13 @@ def estimate_max_model_len(
             else:
                 right = mid - 1
         return result
+    # [CN] 无论是否抛异常都要还原，否则会污染后续所有计算。
     finally:
         # Always restore the original max_model_len to avoid side effects
         vllm_config.model_config.max_model_len = original_max_model_len
 
 
+# [CN] 启动期校验：至少要能装下**一条** max_model_len 的请求。
 def check_enough_kv_cache_memory(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -973,6 +1099,8 @@ def check_enough_kv_cache_memory(
 
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
+    # [CN] 减掉一个 block 的开销，是为常驻的 null block 预留；
+    #      传的是 spec 的**拷贝**，因为分组过程可能就地修改 spec。
         # Reserve the null block BlockPool permanently holds back, so the check
         # plans against usable blocks, as in get_kv_cache_configs. Group a copy
         # of the specs since grouping may unify them in-place.
@@ -990,6 +1118,8 @@ def check_enough_kv_cache_memory(
         )
 
 
+# [CN] 把"层名分组"变成 KVCacheGroupSpec 列表，
+#      每组的最终 spec 由各层 spec 的 merge() 合成。
 def create_kv_cache_group_specs(
     kv_cache_spec: dict[str, KVCacheSpec], grouped_layer_names: list[list[str]]
 ) -> list[KVCacheGroupSpec]:
@@ -1020,6 +1150,9 @@ def create_kv_cache_group_specs(
     return kv_cache_groups
 
 
+# [CN] 所有层是否同构。实现很巧妙：**试着 merge 一次**，
+#      成功就是同构（因为 merge 内部有全部一致性断言），
+#      比罗列一堆 isinstance 判断更不容易漏。
 def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     """
     Whether all layers in the given KVCacheSpec have the same KV cache spec.
@@ -1045,6 +1178,9 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+# [CN] 算 **最大并发数** = 总块数 / 单条满长请求要占的块数。
+#      注意"单条请求占多少块"是各 group 之和：所有 group 都从
+#      **同一个共享块池**里取块，所以要把各组的开销加起来。
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1070,6 +1206,7 @@ def get_max_concurrency_for_kv_cache_config(
     return max_concurrency
 
 
+# [CN] 用户用 num_gpu_blocks_override 手工指定块数时，在这里覆盖掉实测值。
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     """
     Override the number of kv cache blocks if `num_gpu_blocks_override` is set.
@@ -1080,6 +1217,7 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
+# [CN] 一个块在 worker 共享池里占多少字节 = 后面 num_blocks 计算的除数。
 def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     """
     Bytes consumed by one block in the worker's shared KV cache pool, mirroring
@@ -1090,6 +1228,7 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     return _get_kv_cache_bytes_per_block(kv_cache_groups)
 
 
+# [CN] 所有层 page 大小必须一致，否则说明还没做过 unify。
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     """
     Get the page size of the KV cache.
@@ -1099,6 +1238,8 @@ def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     return page_sizes.pop()
 
 
+# [CN] 最简单的情况：所有层 spec 完全一样 -> **一个组**装下所有层。
+#      绝大多数模型走这条路。
 def _get_kv_cache_groups_uniform_spec(
     kv_cache_specs: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1116,6 +1257,8 @@ def _get_kv_cache_groups_uniform_spec(
     return create_kv_cache_group_specs(kv_cache_specs, [list(kv_cache_specs.keys())])
 
 
+# [CN] 次简单：层与层的 spec 不完全相等，但**同构**（需要的 slot 数相同），
+#      比如都是全注意力、只是 hidden size 不同。仍然合成一个组。
 def _get_kv_cache_groups_uniform_type(
     spec: UniformTypeKVCacheSpecs,
 ) -> list[KVCacheGroupSpec]:
@@ -1133,6 +1276,10 @@ def _get_kv_cache_groups_uniform_type(
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
 
 
+# [CN] 流水线并行（PP）下，Mamba 层要分几组才能让每个 stage 的
+#      "Mamba 层数 / MLA 层数"比例都站得住 —— 因为 Mamba 状态要
+#      借宿在 MLA 的 page 里（见 _get_kv_cache_groups_glm5_next）。
+#      某个 stage 有 Mamba 却没有 MLA -> 返回 None（无法安排，报错）。
 def _pp_balanced_mamba_group_count(
     vllm_config: VllmConfig,
     mamba_layer_names: list[str],
@@ -1162,6 +1309,13 @@ def _pp_balanced_mamba_group_count(
     return num_groups
 
 
+# [CN] **GLM-5.3-Flash 的专用分组**（Mamba + MLA 混合架构）。
+#      核心技巧是 **aliasing（别名复用）**：
+#        - Mamba 的状态页被 padding 到与 MLA 页同宽，于是可以和
+#          MLA 层共享同一个 block id（两份数据叠在同一块显存上）；
+#        - kpool 的 tail 暂存页同理复用 indexer 页。
+#      之所以安全：KVCacheTensor 的地址范围允许重叠，
+#      而同一时刻一个块只被一个 group 持有。
 def _get_kv_cache_groups_glm5_next(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1216,6 +1370,8 @@ def _get_kv_cache_groups_glm5_next(
 
     any_mamba = next(iter(mamba_specs.values()))
     assert all(spec == any_mamba for spec in mamba_specs.values())
+    # [CN] Mamba 状态页必须能塞进 MLA 页，否则 aliasing 不成立 ——
+    #      报错并给出可操作的建议（加大 TP 或用更宽的 dtype）。
     if any_mamba.real_page_size_bytes > mla_page:
         raise ValueError(
             f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
@@ -1233,6 +1389,8 @@ def _get_kv_cache_groups_glm5_next(
             "a pipeline stage has mamba layers but no MLA layer to share "
             "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
         )
+    # [CN] 按 index % num_groups 轮转分配，让每个 PP stage 都能拿到
+    #      均衡的 Mamba/MLA 比例。
     mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
@@ -1244,6 +1402,10 @@ def _get_kv_cache_groups_glm5_next(
     )
 
 
+# [CN] **反查**函数：给定已经分好的组，识别出"这是不是 GLM5 布局"，
+#      如果是就把关键几何参数（各页大小、层名分组）解出来。
+#      之所以需要反查：分组结果会经过 PP 投影等变换，
+#      后面的内存计算需要重新认出这个布局。
 def _glm5_next_tensor_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> (
@@ -1332,6 +1494,16 @@ def _glm5_next_tensor_layout(
     )
 
 
+# [CN] **统一各层的 page 大小**（混合模型分组的前提）。
+#      为什么必须统一：所有 group 从同一个块池取块，
+#      如果块大小不一致，分配时会产生内存碎片、无法管理。
+#      三种手段，按优先级：
+#        1) page 能整除最大值 -> 调大 block_size 让它自然变大；
+#        2) Mamba / 非 MLA 注意力 -> 直接把物理页 padding 到最大值
+#           （读的时候用 strided view，尾部空洞浪费一点）；
+#        3) 都不行 -> 抛 NotImplementedError，由上层走兜底路径。
+#      MLA 被排除在 padding 之外：稀疏 MLA 按整 token 行索引缓存，
+#      只能按它自己的 alignment 对齐，不能随便 pad。
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1366,6 +1538,8 @@ def unify_kv_cache_spec_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
+        # [CN] Mamba 的 page 大小由**状态形状**决定，和 block_size 无关，
+        #      所以没法靠调 block_size 变大，只能 pad。
         elif isinstance(layer_spec, MambaSpec):
             # MambaSpec's page size is determined by its state shapes and does
             # not scale with block_size, so pad the page instead. This is the
@@ -1397,11 +1571,16 @@ def unify_kv_cache_spec_page_size(
     return new_kv_cache_spec
 
 
+# [CN] 无注意力模型（spec 为空 dict）不需要 KV cache。
 def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     # kv_cache_spec is an empty dict for attention free models
     return not kv_cache_spec
 
 
+# [CN] **混合注意力模型的通用分组**，本文件最核心的算法之一。
+#      思路：模型的层是按**模式重复**的（比如 1 层全注意力 + 2 层滑窗，
+#      重复 10 次）。于是分成 3 个组，每组 10 层，
+#      worker 侧只需为这 3 个组各建一张 block table 再重复套用。
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1431,6 +1610,15 @@ def _get_kv_cache_groups_uniform_page_size(
     attention layers. There are 3 layers in the pattern (1 * full, 2 * sw), so
     there are 3 kv_cache_groups, each of which represents 10 layers.
 
+    # [CN] 六条假设（读懂这段代码的关键）：
+    #        1) 每个 block 的物理内存必须各组相同（否则碎片化无法管理）；
+    #        2) 每块 token 数目前统一用 cache_config.block_size；
+    #        3) 每 token 每层的字节数由模型配置决定，目前要求全都一样；
+    #        4) 每组的层数目前假设相同（不足就补 padding 层）；
+    #        5) 组内必须是同一种注意力类型（唯一的例外见第 6 条）；
+    #        6) find_longest_cache_hit 目前只支持一种类型，
+    #           或"全注意力 + 恰好一种其它类型"。
+    #      这些假设都是**为了简化实现**，注释里也写明了哪里可以放松。
     To simplify the implementation, we make the following assumptions:
     1. Physical memory per block: Must be the same across all KV cache groups.
     Breaking this assumption is non-trivial due to memory fragmentation concerns
@@ -1467,6 +1655,8 @@ def _get_kv_cache_groups_uniform_page_size(
     Returns:
         The generated KVCacheGroupSpecs
     """
+    # [CN] 第一步：按 spec **相等**分桶（KVCacheSpec 是 frozen dataclass，
+    #      可直接当 dict key）。
     # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
@@ -1474,6 +1664,9 @@ def _get_kv_cache_groups_uniform_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
 
+    # [CN] 第二步：尝试把"只有少数属性不同但可 reconcile"的桶再合并
+    #      （比如只有滑窗大小不同的全注意力层），以**减少组数**。
+    #      判定方式很巧妙：试着 merge 一下，不抛异常就说明能合。
     # Attempt to further merge same-type layers based on whether their KV
     # cache specs can be merged, to minimize the group count. This benefits
     # situations where specs share a block layout and differ only in a
@@ -1495,6 +1688,10 @@ def _get_kv_cache_groups_uniform_page_size(
             layer_buckets.append(list(layer_names))
             spec_buckets.append([layer_spec])
 
+    # [CN] 第三步：把每个桶切成若干小组，让**每组层数相同**，
+    #      不够就在最后一组补 padding 层。
+    #      例：(full.0, full.1) + (sw.0, sw.1, sw.2) -> 3 组各 2 层，
+    #      其中一组是 (sw.1, padding)。
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
     # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
@@ -1507,6 +1704,10 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
+    # [CN] group_size 的**启发式**：默认取最少层的那个类型（n:1 里的 1）；
+    #      但如果最多的也没比最少的多多少（<1.5 倍），就直接取最大值 ——
+    #      理由是补 padding 层会浪费显存，而投机解码的 draft 模型往往会
+    #      给某一种类型多加几层（注释里举了 gpt-oss-20b + eagle 的例子）。
     min_num_layers = min([len(layers) for layers in layer_buckets])
     group_size = min_num_layers
     max_num_layers = max([len(layers) for layers in layer_buckets])
@@ -1529,6 +1730,9 @@ def _get_kv_cache_groups_uniform_page_size(
                 num_padding_layers / len(layers) * 100,
             )
         num_groups = cdiv(len(layers), group_size)
+    # [CN] 这里用 layers[i::num_groups]（**跨步取**）而不是连续切片，
+    #      是为了让流水线并行的每个 stage 都分到均衡的层数。
+    #      注释里举了反例：连续切会让某个 stage 出现空组，被迫整组 padding。
         # In PP case, say if we have
         # - stage 0: full.0, sw.0, sw.1
         # - stage 1: full.1, sw.2, sw.3
@@ -1545,6 +1749,7 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
+# [CN] 取某层在组内的真实 spec（聚合 spec 要拆开取）。
 def _get_per_layer_spec(
     group: KVCacheGroupSpec,
     layer_name: str,
@@ -1555,6 +1760,7 @@ def _get_per_layer_spec(
     return spec
 
 
+# [CN] 一个块要装下"最大的那个组"的所有层页之和。
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
@@ -1574,6 +1780,10 @@ def _get_kv_cache_bytes_per_block(
     return bytes_per_block
 
 
+# [CN] 校验选定的 **layout** 能否表达这个模型的打包方式。
+#      混合 page 大小 = 把多个页**并排**塞进一个块，
+#      这要求"每页在块内是连续的一段"（block-compact）。
+#      走到这里还不行就报错，并提示改 VLLM_KV_CACHE_LAYOUT。
 def validate_kv_cache_layout(
     layout: KVCacheLayout,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1608,6 +1818,8 @@ def validate_kv_cache_layout(
         )
 
 
+# [CN] **从分组结果生成最终的 KVCacheConfig**（num_blocks + tensor 布局）。
+#      核心一步：available_memory // bytes_per_block = num_blocks。
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1636,6 +1848,8 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
+    # [CN] GLM5 特殊布局：手工安排每个层的 offset，让 Mamba / tail 页
+    #      **叠在** MLA / indexer 页上（aliasing）。
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         (
             attn_group,
@@ -1699,6 +1913,7 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
+    # [CN] 通用路径：先确定 layout 并校验，再算每块字节数。
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
@@ -1708,6 +1923,11 @@ def get_kv_cache_config_from_groups(
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
 
+    # [CN] **关键设计：所有 group 都从字节 0 开始 aliasing**。
+    #      上面那张 ASCII 图讲了两者的区别：
+    #        block-outer：每个块里按 [A|B|pad] 排布，每个块重复同样的打包；
+    #        layer-outer：每个层一大片连续区域，里面按 block 排开。
+    #      能这么叠，是因为同一个 block id 任一时刻只属于一个 group。
     # Groups alias from byte 0. Spec regions are laid out differently:
     #
     # block-outer (the same packing repeats for every block):
@@ -1764,6 +1984,10 @@ def get_kv_cache_config_from_groups(
     )
 
 
+# [CN] 把**局部注意力**（滑窗 / 分块局部）的 spec **提升**为全注意力 spec。
+#      重要：这只影响 **KV cache 的分配**（按全量 token 分配块、不做
+#      窗口外回收），注意力模块本身的计算行为**完全不变**。
+#      用途：关闭混合 KV cache manager 时的统一化降级路径。
 def _promote_local_kv_cache_specs(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1805,6 +2029,8 @@ def _promote_local_kv_cache_specs(
         )
         return max(spec.page_size_padded, unpadded_page_size)
 
+    # [CN] 提升映射表：滑窗 MLA -> MLA，滑窗 -> 全注意力，
+    #      分块局部 -> 全注意力。
     promotions: dict[type[AttentionSpec], type[AttentionSpec]] = {
         SlidingWindowMLASpec: MLAAttentionSpec,
         SlidingWindowSpec: FullAttentionSpec,
@@ -1839,6 +2065,8 @@ def _promote_local_kv_cache_specs(
     return promoted_specs
 
 
+# [CN] 兜底路径：page 大小无法统一时，尝试"把滑窗当全注意力分配"。
+#      只在 **MLA + 普通滑窗**这一特定组合下尝试，其它直接放弃。
 def _try_get_full_allocation_fallback_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
@@ -1873,6 +2101,9 @@ def _try_get_full_allocation_fallback_groups(
     return _get_kv_cache_groups_uniform_type(uniform_spec)
 
 
+# [CN] 关闭混合 KV cache manager 时的入口：把所有局部注意力提升为
+#      全注意力。会打一条 warning 告诉用户"省显存的优化没了，
+#      但滑窗的计算节省还在"。
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
     This function tries to convert the KV cache specs to one type if the model
@@ -1897,6 +2128,8 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     kv_cache_spec.update(_promote_local_kv_cache_specs(kv_cache_spec))
 
 
+# [CN] 挑一个"向上取整后总 padding 最少"的块大小（暴力枚举）。
+#      平手时取**更大的** d（组数更少、管理开销更小）。
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1932,6 +2165,11 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
     return best_d
 
 
+# [CN] **混合 page 大小的打包分组**（block-outermost 布局专用）。
+#      思路：先把层贪心地装进"同构桶"，再按**层模式重复次数**切组，
+#      使所有组能塞进同样的每块布局。
+#      Mamba 桶额外处理：限制它不要撑宽块（Mamba 状态页本来就被
+#      padding 到和注意力页同宽）。
 def _get_packed_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1969,12 +2207,16 @@ def _get_packed_kv_cache_groups(
         page_size_layers: dict[int, list[str]] = defaultdict(list)
         for layer_name, layer_spec in bucket.items():
             page_size_layers[layer_spec.page_size_bytes].append(layer_name)
+        # [CN] 只支持 1:1 的层模式（每种 page 大小各一层）；
+        #      2:1 这类虽然理论上也能重复，但当前实现选择整桶输出。
         # Only 1:1 patterns (one layer of each page size per repeat) are
         # supported; counts sharing a gcd > 1 (e.g. 2:1) could in principle
         # repeat too, but such buckets are emitted whole instead.
         balanced = len(set(map(len, page_size_layers.values()))) == 1
         bucketed.append((uniform_spec, page_size_layers, balanced))
 
+    # [CN] 混合 page 大小的桶必须整桶保留，所以它的"每组重复数"给其它
+    #      桶定了一个**下界**；更大的同尺寸桶则被往下切。
     # Balanced buckets that mix page sizes must stay whole, so the largest one
     # sets a floor on the repeats per group; larger single-size buckets are
     # split down toward it. No such bucket means nothing needs packing.
@@ -2010,6 +2252,7 @@ def _get_packed_kv_cache_groups(
             cdiv(len(names), n) * page for page, names in page_size_layers.items()
         )
 
+    # [CN] anchor_bytes = 无论 Mamba 怎么切，一个块**至少**要装下的字节数。
     # Bytes a block must hold however the mamba buckets end up split: a mamba
     # bucket can go down to one state per group, every other bucket's split is
     # already fixed by the repeat pattern.
@@ -2029,6 +2272,8 @@ def _get_packed_kv_cache_groups(
     groups = []
     for spec, page_size_layers, balanced in bucketed:
         num_groups = num_groups_for(spec, balanced)
+            # [CN] Mamba 状态已被 padding 到一个注意力页，所以限制它的组数，
+            #      让它"就着现有的块宽"放，而不是反过来把块撑大。
         # `_align_hybrid_block_size` pads a mamba state up to one attention
         # page, so cap a mamba group at the states a block already fits rather
         # than let it widen the block.
@@ -2063,6 +2308,7 @@ def _get_packed_kv_cache_groups(
     return groups
 
 
+# [CN] 是否是 DeepSeek-V4 + EAGLE 投机（需要走位置兜底规则）。
 def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
@@ -2073,6 +2319,12 @@ def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     )
 
 
+# [CN] 标记哪些组属于 **draft（草稿）模型**。
+#      两条规则：
+#        1) 看 spec 上的 non_causal_multi_token_decode 标志（可靠）；
+#        2) DeepSeek-V4 的兜底：草稿层总是最后注册的那一层（hack）。
+#      第 2 条只在"分组恰好按 kv_cache_spec 划分"时才成立，
+#      所以由调用方按模型类型决定是否启用。
 def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2111,6 +2363,7 @@ def _annotate_eagle_groups(
     if spec_config is None or not spec_config.use_eagle_block_drop():
         return
 
+    # [CN] 规则 1：spec 驱动。
     for group in kv_cache_groups:
         if any(
             getattr(spec, "non_causal_multi_token_decode", False)
@@ -2118,6 +2371,7 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
+    # [CN] 规则 2：位置兜底（最后一层所在的组 = 草稿组）。
     if not use_deepseek_v4_fallback:
         return
     last_layer = next(reversed(kv_cache_spec))
@@ -2127,6 +2381,11 @@ def _annotate_eagle_groups(
             break
 
 
+# [CN] 一个很有价值的**告警**：如果一个组都没被标记成草稿组，
+#      下游会把**所有**组都当草稿组处理，这会让 Mamba 组的查找窗口
+#      要求"连续两个 chunk" —— align 模式永远产生不了，
+#      于是前缀复用**静默地**降到 0。
+#      这种"既不报错也没有指标"的性能悬崖最难查，所以专门加个 warning。
 def _warn_if_unannotated_eagle_mamba(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2169,6 +2428,7 @@ def _warn_if_unannotated_eagle_mamba(
     )
 
 
+# [CN] 求 <= limit 的最大因数（用于给隐藏态层挑合适的 block_size）。
 def _largest_divisor_at_most(value: int, limit: int) -> int:
     for candidate in range(min(value, limit), 0, -1):
         if value % candidate == 0:
@@ -2176,6 +2436,15 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+# [CN] **分组主入口**。按优先级依次尝试：
+#        1) 关闭混合管理器 -> 先做 spec 统一化；
+#        2) 无注意力模型 -> 空列表；
+#        3) 全部同构 -> 一个组；
+#        4) 同构类型（UniformType）-> 一个聚合组；
+#        5) GLM5 专用布局；
+#        6) 打包分组（block-outermost）；
+#        7) 统一 page 大小后走通用混合分组。
+#      隐藏状态层（HiddenStateCacheSpec）全程**单独成组**，不参与合并。
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2190,6 +2459,7 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    # [CN] 用户显式关闭混合管理器时，先统一 spec（会就地修改入参）。
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -2211,6 +2481,8 @@ def get_kv_cache_groups(
     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
         return glm5_groups
 
+    # [CN] 隐藏状态层要用**自己的 block table**，必须先摘出去，
+    #      否则会被同构分桶吞掉。
     # Hidden-state layers use their own block table and must not be absorbed
     # into a compatible attention bucket.
     hidden_specs = {
@@ -2230,6 +2502,8 @@ def get_kv_cache_groups(
         ]
         return packed_groups
 
+    # [CN] 优先保留每层原本的缓存语义；只有 page 实在统一不了，
+    #      才退到"按全注意力分配"的兜底方案。
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
     try:
@@ -2241,6 +2515,8 @@ def get_kv_cache_groups(
         return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
+    # [CN] 把隐藏态层加回来，并把它的 page 对齐到公共 page 大小
+    #      （挑一个不超公共页的最大 block_size，浪费的字节打日志告知）。
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
         common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
@@ -2266,6 +2542,9 @@ def get_kv_cache_groups(
     return groups
 
 
+# [CN] 生成**调度器侧**的配置：各 worker 的配置除了层名都一样，
+#      所以随便取一份深拷贝，再把聚合 spec 简化成"代表性单层 spec"。
+#      （调度器只关心容量，不关心具体是哪些层。）
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
@@ -2288,6 +2567,7 @@ def generate_scheduler_kv_cache_config(
     return cfg
 
 
+# [CN] KV cache 总容量（token 数）与最大并发。
 def get_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, float]:
@@ -2301,6 +2581,8 @@ def get_kv_cache_capacity(
     return int(max_concurrency * max_model_len), max_concurrency
 
 
+# [CN] 把容量写回 cache_config 并打日志（那句 "GPU KV cache size: N tokens"
+#      就是这里输出的，是排查显存问题时最常见的日志之一）。
 def update_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
@@ -2318,6 +2600,9 @@ def update_kv_cache_capacity(
     )
 
 
+# [CN] 从分组算最大内存占用。注意它**把 padding 也算进去**了：
+#      混合模型补齐层数后，显存是按补齐后的数字算的。
+#      另外每个组独立从共享池取块，所以总开销是各组之和。
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2374,6 +2659,7 @@ def _max_memory_usage_bytes_from_groups(
     return bytes_per_block * total_blocks
 
 
+# [CN] 二分查找"给定显存最多能跑多长"（组版本，比 spec 版本更准）。
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2409,6 +2695,8 @@ def _estimate_max_model_len_from_groups(
         vllm_config.model_config.max_model_len = original_max
 
 
+# [CN] max_model_len = -1 时的**自动适配**：二分找所有 worker 都能
+#      支持的最大长度，取最小值（木桶效应），并打日志说明被谁限制。
 def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
@@ -2473,6 +2761,8 @@ def _auto_fit_max_model_len(
         )
 
 
+# [CN] 把全局分组**投影**到某个 worker 实际拥有的层上（PP 场景）。
+#      聚合 spec 要按该 worker 的层名重建，空组也要保留（占位）。
 def _project_kv_cache_groups_to_worker(
     global_kv_cache_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
@@ -2515,6 +2805,15 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+# [CN] **生成所有 worker 的 KV cache 配置** —— 整个模块的顶层入口。
+#      docstring 里的五步流程就是全部要点：
+#        1) 合并各 worker 的 spec（PP 各 stage 层不同，要并起来）；
+#        2) 按整模型的层比例分组（顺带处理混合模型的 spec 统一）；
+#        3) 用"投影到各 worker 的分组"做自动适配与显存校验；
+#        4) 为每个 worker 生成配置；
+#        5) 把所有 rank 的 num_blocks **拉齐到最小的那个** ——
+#           因为调度器是中心化的，块数必须各 rank 一致，
+#           否则某个 rank 会分配到别的 rank 没有的块 id。
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2550,6 +2849,7 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
+    # [CN] 合并时要求**同名层的 spec 必须一致**，否则直接 assert 失败。
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
@@ -2568,6 +2868,8 @@ def get_kv_cache_configs(
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
 
+    # [CN] 多层 MTP 投机时，给所有滑窗 spec 打上"额外保留 token 数" ——
+    #      因为草稿模型可能会回过头重算末尾若干 token。
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
     extra_retained_tokens = (
@@ -2595,6 +2897,9 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
+    # [CN] num_gpu_blocks_override 会让"实际分配的块数"与"实测显存"脱钩，
+    #      所以这里同步调整 available_memory，让自动适配、准入检查、
+    #      配置生成三者**按同一个容量**规划（否则会互相矛盾）。
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
     # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps
@@ -2617,6 +2922,8 @@ def get_kv_cache_configs(
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
+    # [CN] 预留一个块给常驻的 null block，让自动适配与容量检查都按
+    #      "真正可用"的块数来规划。
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
@@ -2652,6 +2959,8 @@ def get_kv_cache_configs(
             )
         )
 
+    # [CN] 拉齐 num_blocks：用最小块的显存量**重新规划**一遍，
+    #      而不是简单改个数字 —— 这样 stride 和 offset 才保持一致。
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
@@ -2671,6 +2980,13 @@ def get_kv_cache_configs(
     return kv_cache_configs
 
 
+# [CN] **块哈希粒度的适配器**：把按 hash_block_size 算出来的哈希，
+#      "看成"按 target_block_size 粒度的哈希。
+#      为什么能这么做：每个 hash_block_size 的哈希是**链式**的，
+#      已经包含了它之前的全部内容 —— 所以目标块内**最后一个**
+#      细粒度哈希，天然就是整个目标块的哈希。
+#      docstring 里那张对照表把这个关系画得很清楚（16->32 取 B、D）。
+#      好处：不同 group 用不同块大小时，哈希**只算一次**就能共用。
 class BlockHashListWithBlockSize:
     """
     Convert block-hash granularity from `hash_block_size` to `target_block_size`.
@@ -2705,6 +3021,7 @@ class BlockHashListWithBlockSize:
         target_block_size: Desired block size; must be a multiple of `hash_block_size`.
     """
 
+    # [CN] 只支持**整数倍放大**（target 是 hash 的整数倍）。
     def __init__(
         self,
         block_hashes: list[BlockHash],
@@ -2738,6 +3055,7 @@ class BlockHashListWithBlockSize:
         for i in range(len(self)):
             yield self._get_value_at(i)
 
+    # [CN] 就是上面说的：取目标块内最后一个细粒度哈希。
     def _get_value_at(self, idx: int) -> BlockHash:
         # The last hash_block_size hash within the target block already chains
         # over the whole prefix, so it is the target block's hash.
@@ -2747,6 +3065,9 @@ class BlockHashListWithBlockSize:
 BlockHashList = list[BlockHash] | BlockHashListWithBlockSize
 
 
+# [CN] 按目标块大小解析出合适的哈希视图。
+#      三种情形：粒度相同直接用；已经是视图就复用；
+#      支持细粒度查找时保留原始细哈希（用于块内部分命中）。
 def resolve_block_hashes(
     block_hashes: BlockHashList,
     hash_block_size: int,

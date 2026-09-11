@@ -1,5 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ==============================================================================
+# 本文件职责：**vLLM V1 的心脏** —— EngineCore 及其多进程/数据并行包装。
+#   真正"跑模型"的那一步就在这里：调度 -> 执行 -> 拿回输出 -> 再调度。
+#   它运行在 **EngineCore 进程**里（也可能因 InprocClient 而在前端进程里）。
+#
+# 在系统链路中的位置：
+#   前端进程                              │  EngineCore 进程【本文件】
+#   --------------------------------------┼-------------------------------------
+#   LLMEngine/AsyncLLM -> core_client     │  EngineCoreProc.run_busy_loop()
+#     --EngineCoreRequest(ZMQ)-->   ⇒     │    -> _process_input_queue()
+#                                         │    -> EngineCore.step()【核心】
+#                                         │         ├─ scheduler.schedule()
+#                                         │         ├─ model_executor.execute_model()
+#                                         │         └─ scheduler.update_from_output()
+#                                         │    -> process_output_sockets() 发回
+#   output_processor <--EngineCoreOutputs ⇐ │
+#
+# 类层次（继承关系）：
+#   EngineCore                ：纯逻辑核心。持有 executor + scheduler + KV cache 配置，
+#                               暴露 step() / add_request() / 各种 utility 方法。
+#                               **不涉及任何 ZMQ / 进程**。
+#   EngineCoreProc(EngineCore)：给核心加上"进程外壳"：ZMQ 收发、握手、忙循环、
+#                               优雅退出、异常兜底。在线/离线多进程模式跑的就是它。
+#   DPEngineCoreProc          ：数据并行版，额外做波次同步、DP 屏障、弹性扩缩容。
+#   EngineCoreActorMixin      ：Ray actor 形态（Serverless / Ray DP）用的混入。
+#
+# 核心内容速查（按阅读顺序）：
+#   - _initialize_kv_caches   : profile 显存 -> 算 KV cache 大小 -> 建 KV cache（**最耗时**）
+#   - add_request / abort_requests：请求进出调度器
+#   - step / step_with_batch_queue：**主循环的一步**（后者支持异步调度/PP 流水线）
+#   - post_step                ：步后收尾（DP 波次、异步调度记账）
+#   - pause_scheduler / sleep / wake_up：暂停与休眠（在线更新权重用）
+#   - preprocess_add_request   ：EngineCoreRequest -> Request 的转换点
+#   - EngineCoreProc.run_busy_loop / _process_input_queue / _process_engine_step
+#   - _handle_client_request / _invoke_utility_method：控制类 RPC 的服务端分派
+#   - process_input_sockets / process_output_sockets：ZMQ 收发
+#
+# 阅读提示（几个容易踩的点）：
+#   1. **step() 是同步的、阻塞的**（里面有 CUDA 执行）。所以它必须由独立进程
+#      或独立线程驱动 —— 绝不能放在 asyncio 事件循环里（这也是"异步+进程内"
+#      组合被 core_client 明确拒绝的原因）。
+#   2. **两种 step**：没有 batch_queue 时用 step()（简单：调度->执行->更新）；
+#      有 batch_queue（异步调度 / PP 消除流水线气泡）时用 step_with_batch_queue()，
+#      它会**提前**调度下一批、把上一批的结果延后处理。看懂这两个函数的
+#      对应关系，就理解了 vLLM 的吞吐优化主线。
+#   3. **配置在这里会被改写**：_initialize_kv_caches 会改 max_model_len、
+#      num_gpu_blocks、block_size、enable_chunked_prefill、enable_prefix_caching。
+#      前端拿到的最终值靠握手（EngineCoreReadyResponse）回传。
+#   4. **freeze_gc_heap()**：启动时把"已经分配好的静态对象"标记为不被 GC 扫描，
+#      能显著降低老年代 GC 停顿。副作用是此后**环境变量读取被缓存**
+#      （enable_envs_cache），运行时改环境变量不再生效 —— 排查问题时要注意。
+# ==============================================================================
 import gc
 import os
 import queue
@@ -105,6 +157,14 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
+    # [CN] 一句话概括它的职责：**把调度器和执行器粘在一起，并驱动它们转起来**。
+    #      它自己不实现调度算法（在 v1/core/sched/）、也不实现模型执行
+    #      （在 v1/worker/ 与 v1/executor/），只负责：
+    #        1) 初始化：建 executor -> profile 显存 -> 建 KV cache -> 建 scheduler；
+    #        2) 循环  ：schedule() -> execute_model() -> update_from_output()；
+    #        3) 运维  ：abort / sleep / profile / LoRA / collective_rpc 等控制接口。
+    #      它是**进程内纯逻辑**，不知道 ZMQ 和子进程的存在（那是 EngineCoreProc 的事）。
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -114,11 +174,15 @@ class EngineCore:
         include_finished_set: bool = False,
     ):
         # plugins need to be loaded at the engine/scheduler level too
+        # [CN] 注意插件要在**引擎进程**里也加载一遍：前端进程加载过的不算，
+        #      因为这是两个进程（自定义模型/量化/日志器都需要在本进程注册）。
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        # [CN] 只让"主 rank"打日志：DP>1 时会拉起多个进程，
+        #      每个都打一遍同样的配置日志会刷屏（而且内容一样）。
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -131,9 +195,13 @@ class EngineCore:
         self._weight_version = "default"
 
         # Setup Model.
+        # [CN] executor_class 由配置决定（uni / multiproc / ray / external_launcher）。
+        #      这一步会**拉起 worker 进程、加载模型权重**（几十秒级，最耗时之一）。
         self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
+            # [CN] 失败回调：worker 进程崩溃时通知上层（EngineCoreProc 会用它
+            #      往输入队列塞 EXECUTOR_FAILED 哨兵，触发优雅退出）。
             self.model_executor.register_failure_callback(executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
@@ -151,6 +219,9 @@ class EngineCore:
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
             # chunked prefill. But do SSM models?
+            # [CN] 没有 KV cache 组 = 纯 encoder / attention-free 模型。
+            #      chunked prefill 的前提是"可以分块缓存 KV"，这里不成立，
+            #      强行开会让调度器算出错误的块边界，所以直接关掉。
             if vllm_config.scheduler_config.enable_chunked_prefill:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
@@ -207,6 +278,10 @@ class EngineCore:
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
+        # [CN] batch_queue 是**异步调度**的核心：允许"第 N+1 批已经在 GPU 上跑，
+        #      同时 CPU 在调度第 N+2 批"，从而把 CPU 调度时间藏进 GPU 执行时间里。
+        #      PP（流水线并行）下它是**必需**的：否则各 stage 会互相等待，
+        #      产生大量流水线气泡（bubble），吞吐腰斩。
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
@@ -232,26 +307,49 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
+        # [CN] 用**函数指针**在构造时一次性定好走哪条 step，
+        #      避免每次循环都判断 if（热路径上的小优化，也让代码更好读）。
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # [CN] abort 请求先入队，**在 step 之间统一处理**，而不是立即改调度器状态。
+        #      原因：调度器可能正处在"已调度但未执行"的中间态，
+        #      就地 abort 会破坏它的不变式。
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
+        # [CN] 启动阶段创建的对象（配置、模型结构、KV cache 元数据等）
+        #      基本都是"活到进程结束"的，把它们挪出 GC 扫描范围，
+        #      可以显著降低老年代 GC 的停顿（对尾延迟很关键）。
+        #      **副作用**：此后不能再有新的长期对象加入（会被 GC 反复扫描）。
         freeze_gc_heap()
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
+        # [CN] 缓存环境变量读取结果：envs 里每次访问都做 os.getenv 太慢
+        #      （热路径上会被调用成千上万次）。
+        #      **副作用**：启动之后再用 os.environ 改 VLLM_* 将**不再生效** ——
+        #      这是排查"为什么改了环境变量没反应"的高频答案。
         enable_envs_cache()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
+        """[CN] 引擎初始化里**最重、最关键**的一步，完整流程：
+          1) 收集各 worker 的 KV cache 规格（每层多少头、什么 dtype/布局）；
+          2) 处理非因果注意力的特例（关 chunked prefill / prefix caching）；
+          3) 决定 KV cache 布局（NHD / HND）；
+          4) **profile 显存**：跑一次假前向，测出还剩多少显存能给 KV cache；
+          5) 按剩余显存算出 block 数量，必要时**下调 max_model_len**（auto-fit）；
+          6) 真正分配 KV cache，并编译/预热模型（torch.compile + CUDA graph）。
+        这一步通常要几十秒到几分钟，日志里那句
+        "init engine (profile, create kv cache, warmup model) took ..." 就是它。
+        """
         start = time.time()
 
         # register all kvcache specs in enginecore process.
@@ -325,6 +423,10 @@ class EngineCore:
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
         # and have the original (larger) max_model_len cached.
+        # [CN] 一个典型的"分布式状态不一致"坑：显存不够时第 5 步会把
+        #      max_model_len 调小，但 worker 进程是在这**之前**就建好的，
+        #      它们缓存的还是旧的大值。所以必须广播一次更新，
+        #      否则 worker 会按更大的长度去分配 buffer / 校验输入。
         max_model_len_after = vllm_config.model_config.max_model_len
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
@@ -603,6 +705,9 @@ class EngineCore:
     def _should_throttle_prefills(self) -> bool:
         """Whether to defer new prefills this step (DP prefill balancing).
         Overridden by the DP engine core; never throttles otherwise."""
+        # [CN] 钩子方法：基类恒为 False（不限流）；DP 版会按各 rank 的 prefill
+        #      压力决定"这一轮先别塞新的 prefill"，避免某个 rank 堆太多长 prompt
+        #      而拖慢整波（DP 要齐步走，最慢的 rank 决定整波时间）。
         return False
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -610,14 +715,31 @@ class EngineCore:
 
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
+
+        [CN] 这是**整个 vLLM 最核心的十几行**，一次 step 做四件事：
+          1) scheduler.schedule()        —— 决定这一轮算哪些请求、各算多少 token；
+          2) model_executor.execute_model(non_block=True) —— 把任务丢给 GPU
+             （non_block 表示**不阻塞**，返回一个 Future，CPU 可以先去干别的）；
+          3) 趁 GPU 在跑，CPU 去算语法位掩码（结构化输出的约束）；
+             —— 这就是"CPU/GPU 重叠"，把调度与后处理藏进 GPU 时间里；
+          4) future.result() 取回结果 -> scheduler.update_from_output()
+             —— 更新请求状态、释放/分配 block、产出给前端的输出。
+
+        返回值的第二个布尔是"本轮是否真的执行了模型"：
+        为 False 表示这一轮啥也没算（比如所有请求都在等），
+        上层据此判断要不要继续/post_step。
         """
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        # [CN] 无事可做就直接返回空：这是忙循环里的"空转"路径，
+        #      也是 has_requests 语义的关键（包含"已结束但还没从 batch 摘掉"的请求）。
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        # [CN] 结构化输出（grammar / JSON schema）的位掩码计算是**纯 CPU** 的，
+        #      放在这里正好和 GPU 执行重叠，等于免费。
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -625,10 +747,16 @@ class EngineCore:
         ):
             model_output = future.result()
             if model_output is None:
+                # [CN] execute_model 返回 None 表示"只跑了前向、没采样"
+                #      （比如 PP 的最后一段才采样，或者外部 sampler 场景），
+                #      这里补一次采样。
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        # [CN] abort 必须在这里统一处理：**模型执行的这段时间里**可能来了取消请求。
+        #      先处理 abort 再 update_from_output，否则调度器会去更新一个已经
+        #      被取消的请求（浪费工作，还可能把它复活）。
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -638,9 +766,16 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
+        """[CN] 一步之后的收尾（主要是投机解码的草稿 token）。
+        注意它是**独立于 step 的一个方法**，由调用方（InprocClient.get_output、
+        EngineCoreProc._process_engine_step）在 step 之后调用。
+        """
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
+        # [CN] 异步调度下，草稿 token 是在 worker 进程里就地更新的
+        #      （因为调度已经跑到前面去了，这里拿到的是"过期"的信息），
+        #      所以只有**非异步**时才在这里更新。
         if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
@@ -661,6 +796,14 @@ class EngineCore:
         is full or no other requests can be scheduled, we block until the first
         batch in the job queue is finished.
         3. Update the scheduler from the output.
+
+        [CN] 用大白话解释这个"反直觉"的设计：
+          **填满队列的优先级高于取结果**。
+          因为只要 GPU 一直在忙，吞吐就最大；所以每轮先尽量把新批次塞进队列，
+          只有当队列满了（或者实在没请求可调）时才去阻塞等一个结果回来。
+          这样 GPU 上同时有 batch_queue_size 个批次在跑/排队，
+          CPU 的调度开销被完全隐藏 —— 代价是单个请求的时延会略微增加
+          （结果要等队列轮转，所以注释里说"后者更偏 TTFT"）。
         """
 
         batch_queue = self.batch_queue
@@ -684,6 +827,9 @@ class EngineCore:
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
+                # [CN] 池化模型不需要采样（前向输出就是结果）；
+                #      本轮没调度到任何 token 时也没有东西可采样。
+                #      这两种情况下"执行 future"就是最终结果。
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
@@ -717,6 +863,9 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
+        # [CN] deque + appendleft/pop（右端出）：**先进先出**，
+        #      保证批次按顺序被回收（顺序乱了会让调度器的"已调度但未确认"
+        #      记账对不上）。这是唯一一处会真正阻塞的地方。
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,

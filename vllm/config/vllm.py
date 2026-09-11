@@ -449,14 +449,51 @@ class VllmConfig:
     simplifies passing around the distinct configurations in the codebase.
     """
 
+    # ==========================================================================
+    # [CN] VllmConfig 总览：整个 vLLM 配置体系的**根节点**。
+    #
+    # 它做三件事：
+    #   1) **聚合**：把十几个子配置（ModelConfig / CacheConfig / ParallelConfig /
+    #      SchedulerConfig / ...）收成一个对象，代码里只传 VllmConfig 一个参数；
+    #   2) **联合校验与推导**：子配置各自只管自己，跨配置的约束（显存预算、并行度、
+    #      投机解码与模型的一致性、KV 传输与调度策略的匹配）全在 __post_init__ 里做；
+    #   3) **指纹**：compute_hash() 产出"计算图指纹"，供 torch.compile 缓存与
+    #      CUDA Graph 缓存复用（见下方 compute_hash 的说明）。
+    #
+    # 字段分三组，理解分组是读这个类的前提：
+    #   A. 子配置字段（model_config ... reasoning_config）
+    #      —— 绝大多数用 `Field(default_factory=XxxConfig)` 延迟构造，
+    #         因为很多子配置类在 __post_init__ 里会做探测（读环境变量、查硬件），
+    #         写成 `= XxxConfig()` 会在**类定义时**就执行一次，既慢又有副作用。
+    #   B. 顶层标量（instance_id / optimization_level / performance_mode /
+    #      shutdown_timeout ...）—— 不属于任何子配置，由 VllmConfig 自己持有。
+    #   C. 可选子配置（lora_config / speculative_config / diffusion_config /
+    #      quant_config / kv_transfer_config / kv_events_config / ec_transfer_config /
+    #      reasoning_config / weight_transfer_config）
+    #      —— 默认 None，语义是"该功能未启用"，下游代码统一用 `is not None` 判断。
+    #
+    # 生命周期提示：
+    #   - 由 EngineArgs.create_engine_config() 构造（见 engine/arg_utils.py）；
+    #   - 构造后通常通过 set_current_vllm_config() 放进上下文变量，
+    #     模型层用 get_current_vllm_config() 取（这样不用层层传参）；
+    #   - 运行期**不应修改**，改了也不会重新触发校验。
+    # ==========================================================================
+
     # TODO: use default_factory once default constructing ModelConfig doesn't
     # try to download a model
+    # [CN] 唯一的例外：model_config 直接赋 None（带 type: ignore），
+    #      不能用 default_factory=ModelConfig —— 因为构造一个默认 ModelConfig
+    #      会触发模型下载/配置读取。它是**必填字段**，由调用方显式传入。
     model_config: ModelConfig = None  # type: ignore[assignment]
     """Model configuration."""
     cache_config: CacheConfig = Field(default_factory=CacheConfig)
     """Cache configuration."""
     parallel_config: ParallelConfig = Field(default_factory=ParallelConfig)
     """Parallel configuration."""
+    # [CN] 注意：这里不是 default_factory=SchedulerConfig，而是
+    #      SchedulerConfig.default_factory —— 一个**类方法**，它会读取环境变量
+    #      VLLM_MAX_NUM_BATCHED_TOKENS / VLLM_MAX_NUM_SEQS 来生成默认值。
+    #      目的是让"scheduler 默认值"能在不构造完整配置的情况下被取到。
     scheduler_config: SchedulerConfig = Field(
         default_factory=SchedulerConfig.default_factory,
     )
@@ -488,6 +525,11 @@ class VllmConfig:
         default_factory=ObservabilityConfig
     )
     """Observability configuration."""
+    # [CN] quant_config 是**运行时解析结果**而非用户输入：
+    #      用户输入是 model_config.quantization（一个名字），真正的
+    #      QuantizationConfig 对象要等模型配置就绪后，由
+    #      VllmConfig._get_quantization_config() 加载量化方法插件来生成，
+    #      并在这里缓存。因此它是 None 直到 __post_init__ 跑完。
     quant_config: QuantizationConfig | None = None
     """Quantization configuration."""
     compilation_config: CompilationConfig = Field(default_factory=CompilationConfig)
@@ -516,10 +558,15 @@ class VllmConfig:
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
+    # [CN] additional_config 是"逃生舱"：给平台插件、实验特性、树外注册用的杂项口袋。
+    #      它参与 compute_hash()，所以放进去的东西会影响编译缓存是否命中——
+    #      只放真正影响行为的项，别拿它当运行时传参通道。
     additional_config: dict | SupportsHash = Field(default_factory=dict)
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    # [CN] instance_id：多实例（尤其是 DP 多 rank、或同一进程内多个引擎）时用于区分。
+    #      空串表示单实例，很多日志/指标代码都以它是否为空来决定要不要加前缀。
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -665,8 +712,16 @@ class VllmConfig:
         ]
         return hash_str
 
+    # ---------------- 派生属性区（只读、无副作用，供调度器与 worker 统一取值） ------
+    # [CN] 这一组 property 的共同目的：把"某个数值该怎么算"收敛到唯一一处，
+    #      避免调度器、worker warmup、KV cache 预留各自推导导致口径漂移。
+
     @property
     def is_mm_encoder_only(self) -> bool:
+        """只跑多模态编码器的模式（不跑 LLM）。
+
+        此时引擎的输入是图像/音频，输出是 embedding 而非文本。
+        """
         mm_config = (
             self.model_config.multimodal_config
             if self.model_config is not None
@@ -676,6 +731,13 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        """同时在飞的 batch 数量上限。
+
+        中文：为什么会有多个 batch 同时"在飞"：
+          - 流水线并行（PP）需要 pp_size 个 batch 才能填满流水线各级；
+          - 异步调度（async scheduling）需要 2 个 batch：一个在 GPU 上跑，
+            另一个在 CPU 上做调度准备，从而把 CPU 开销藏起来。
+        """
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -689,6 +751,13 @@ class VllmConfig:
 
     @property
     def max_in_flight_tokens(self) -> int:
+        """已调度但尚未结算（block 未释放）的 token 数上限。
+
+        中文：= 并发 batch 数 × 每批 token 上限。它决定 KV cache 需要额外预留多少
+        余量。滑动窗口 / chunked-local 这类"可回收"的 KV 规格尤其需要它：
+        超出窗口的 block 是按"已处理 token"为基准释放的，
+        因此同时在飞的几步会**暂时**多占一些 block，不预留就会踩空。
+        """
         # Upper bound on tokens that are scheduled but not yet settled (freed):
         # every concurrent batch may hold up to a full `max_num_batched_tokens`.
         # Recycling-aware KV cache specs (sliding-window, chunked-local) reserve
@@ -700,6 +769,13 @@ class VllmConfig:
 
     @property
     def num_speculative_tokens(self) -> int:
+        """每步由 drafter 提议的 token 数；未启用投机解码时为 0。
+
+        中文：两个来源互斥地提供这个值——
+          - 投机解码（speculative_config.num_speculative_tokens）；
+          - 扩散 LLM（diffusion_config.canvas_length，即一次生成的画布长度）。
+        下游（KV 预留、batch 尺寸计算、uniform_decode_query_len）都读这一个属性。
+        """
         if (
             self.speculative_config is not None
             and self.speculative_config.num_speculative_tokens is not None
@@ -722,6 +798,17 @@ class VllmConfig:
         builds its own `SchedulerOutput`s. Consumers must read this property
         rather than re-deriving their own per-method lookahead, so the
         scheduler and warmup cannot drift apart.
+
+        中文：需要在目标模型"本步 query 范围之外"额外预留多少个 KV slot。
+        因为 drafter 会为超出目标 query 范围的位置写入 KV，所以**所有**预留 block
+        的地方（调度器的 allocate_slots、以及 worker warmup 自己构造 SchedulerOutput 时）
+        都必须加上这个余量。
+        各方法的差异：
+          - DFlash：in-fill 式解码，除了各 draft token 的 query，还多一个"最后采样 token"
+            的 query，所以要 num_speculative_tokens + 1；
+          - EAGLE / DSpark / draft model：draft block 里 anchor 本身就是第一个预测位置，
+            不需要额外的 bonus query，恰好是 num_speculative_tokens；
+          - 其他：0。
         """
         speculative_config = self.speculative_config
         if speculative_config is None:
@@ -757,11 +844,31 @@ class VllmConfig:
         `num_speculative_tokens` and verifies the same `1 + n`. Deriving one
         from the other would under-size EAGLE by a full request width, which is
         the failure this property exists to prevent.
+
+        中文：= 1 + 投机 token 数。"1" 是本步新采样出的那个 token 的 query，
+        其余是每个 draft token 各一个 query。因此调度器能构造的**最宽**的
+        均匀 decode batch = max_num_seqs × uniform_decode_query_len 个 token。
+
+        ⚠️ 它和上面的 num_lookahead_tokens 是**两个不同的契约**，不要互相推导：
+        前者是"query 长度"（请求要算多少个位置），后者是"KV 预留量"（要占多少个 slot）。
+        二者相差不是常数：DFlash 预留 n+1 个 slot 但只验证 1+n 个 query，
+        EAGLE 预留 n 个也验证 1+n 个 query。若用预留量反推 query 长度，
+        会把 EAGLE 少算整整一个请求宽度——这正是本属性存在的意义。
         """
         return 1 + self.num_speculative_tokens
 
     @property
     def use_v2_model_runner(self) -> bool:
+        """是否启用 Model Runner V2（走 `vllm/v1/worker/gpu/` 那套拆分实现）。
+
+        中文：判定优先级依次是——
+          1) 环境变量 VLLM_USE_V2_MODEL_RUNNER 显式设置时，直接以它为准；
+          2) ROCm 平台 + 特定架构（ROCM_DEFAULT_MRV1_ARCHITECTURES）→ 强制回退 V1；
+          3) 没装 Triton → 回退 V1（V2 依赖 Triton）；
+          4) 命中 V2 尚不支持的特性（_get_v2_model_runner_unsupported_features）→ 回退 V1；
+          5) 其余默认走 V2。
+        注意每步回退都会 warning_once，排查"为什么没走 V2"时看启动日志即可。
+        """
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
             return use_v2_model_runner
@@ -827,6 +934,14 @@ class VllmConfig:
         return bool(architectures & default_breakable_cudagraph_architectures())
 
     def _maybe_enable_breakable_cudagraph(self) -> bool:
+        """按需开启 breakable cudagraph，并据此关闭 torch.compile。
+
+        中文：breakable cudagraph 与 torch.compile 是**互斥**的两条加速路线
+        （前者把 cudagraph 拆成可打断的小段以兼容动态形状），
+        所以一旦启用就必须把 compilation_config.mode 置为 NONE。
+        副作用：会**直接改写 os.environ**，但只在用户没显式设置
+        VLLM_USE_BREAKABLE_CUDAGRAPH 时才写（尊重显式配置）。
+        """
         if (
             "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
             and self._uses_breakable_cudagraph_by_default()
@@ -859,6 +974,13 @@ class VllmConfig:
 
         Returns:
             True if DPCoordinator process is needed, False otherwise.
+
+        中文：DPCoordinator 是 DP 部署下的**独立协调进程**，两种场景需要它：
+          1) MoE 模型 + DP>1：做 wave 协同（即使 external LB 也需要，
+             因为 wave 协同逻辑本身就跑在 coordinator 里）；
+          2) 非 MoE 模型 + internal/hybrid LB：收集并发布各 rank 的队列统计，
+             供跨 rank 负载均衡决策。
+        表达式的逻辑：DP>1 且（model_config 为空 或 是 MoE 或 非 external LB）。
         """
 
         # For non-MoE models, only need coordinator in internal/hybrid LB mode
@@ -891,19 +1013,30 @@ class VllmConfig:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             enable_trace_function_call(log_path)
 
+    # [CN] 量化配置的构造分三步：读 HF 的 quantization_config → 校验硬件能力 → 校验数据类型。
+    #      三步都会抛 ValueError，且都在启动早期，属于"快速失败"。
+    #
+    #      注意这里有个隐藏约束：量化方法是在**读权重之前**根据 config 决定的，
+    #      所以 model_config.quantization 可以是 None（自动推断）、也可以是显式方法名。
+    #      自动推断发生在 ModelConfig 里，这里只处理"已经有结论"的情况。
     @staticmethod
     def _get_quantization_config(
         model_config: ModelConfig, load_config: LoadConfig
     ) -> QuantizationConfig | None:
         """Get the quantization config."""
+        # [CN] 延迟导入：platforms 会拉起 torch，避免在纯配置场景付出导入代价
         from vllm.platforms import current_platform
 
         if model_config.quantization is not None:
+            # [CN] get_quant_config 会去模型仓库读 config.json 里的 quantization_config 字段；
+            #      因此这一步可能有网络/磁盘 IO，是启动耗时的组成部分之一
             from vllm.model_executor.model_loader.weight_utils import get_quant_config
 
             quant_config = get_quant_config(model_config, load_config)
             capability_tuple = current_platform.get_device_capability()
 
+            # [CN] 硬件能力校验：例如 FP8 需要 SM89+(Ada)/SM90+(Hopper)，
+            #      get_min_capability() 由各量化方法自己声明。CPU 等平台返回 None，跳过检查。
             if capability_tuple is not None:
                 capability = capability_tuple.to_int()
                 if capability < quant_config.get_min_capability():
@@ -913,6 +1046,8 @@ class VllmConfig:
                         f"capability: {quant_config.get_min_capability()}. "
                         f"Current capability: {capability}."
                     )
+            # [CN] 激活值 dtype 校验：有些量化只支持特定激活精度（如 FP8 要求 bf16/fp16）；
+            #      与 capability 检查是两回事——一个是硬件，一个是算法语义
             supported_dtypes = quant_config.get_supported_act_dtypes()
             if model_config.dtype not in supported_dtypes:
                 raise ValueError(
@@ -920,6 +1055,9 @@ class VllmConfig:
                     f"method {model_config.quantization}. Supported dtypes: "
                     f"{supported_dtypes}"
                 )
+            # [CN] 最后一环：让量化方法按实际模型做二次调整
+            #      （如 FP8 需要根据 config 里的 activation_scheme 决定是否启用动态缩放，
+            #       或 compressed-tensors 需要按 layer 名匹配忽略列表）
             quant_config.maybe_update_config(
                 model_config.model,
                 hf_config=model_config.hf_config,
@@ -928,6 +1066,12 @@ class VllmConfig:
             return quant_config
         return None
 
+    # [CN] 对外的安全版本。
+    #      为什么需要深拷贝：下面的 _ 版本内部会调用 maybe_update_config，
+    #      而它有可能**就地修改**传入的 model_config（这是一处已知的实现缺陷，
+    #      见上面原注释 "For some reason..."）。用 deepcopy 隔离，
+    #      保证调用方的 model_config 不被污染——代价是多一次拷贝开销，
+    #      但这个方法只在启动时调用少数几次，可以接受。
     @staticmethod
     def get_quantization_config(
         model_config: ModelConfig, load_config: LoadConfig
@@ -940,11 +1084,24 @@ class VllmConfig:
             copy.deepcopy(model_config), load_config
         )
 
+    # [CN] 「换一个 HF config，派生出一份新的 VllmConfig」——不可变式更新。
+    #
+    #      典型用途：
+    #        - 模型注册/能力探测阶段，需要按不同 architectures 试算；
+    #        - 多模态模型里拿 text_config 单独推一份语言侧配置；
+    #        - speculative decoding 里为 draft 模型构造独立配置。
+    #
+    #      为什么用 dataclasses.replace 而不是改 self：
+    #      保证原配置对象不被改动，可安全地并发/重复派生。
     def with_hf_config(
         self,
         hf_config: PretrainedConfig,
         architectures: list[str] | None = None,
     ) -> "VllmConfig":
+        # [CN] 补齐 architectures：HF 的 config.json 未必写这个字段，
+        #      但 vLLM 的模型注册是按 architectures 名字匹配的，缺了会找不到实现。
+        #      优先用调用方显式给的；否则查 transformers 的 MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+        #      按 model_type 反查一个默认架构名。
         if architectures is not None:
             hf_config = copy.deepcopy(hf_config)
             hf_config.architectures = architectures
@@ -987,6 +1144,16 @@ class VllmConfig:
         # Therefore, the presence of tie_word_embeddings in SomeVLTextConfig cannot
         # be used as a signal for whether tie_word_embeddings should be copied from
         # hf_config to the language_model config.
+        #
+        #
+        # [CN] 上面那段英文的中文概括（多模态权重绑定的补偿逻辑）：
+        #      一句话概括：Transformers v5 把 tie_word_embeddings 放在**能看到被绑定两个层的那一级**
+        #      配置上（多模态模型里是最外层的 VLConfig），而 vLLM 的 lm_head 挂在 language_model 下，
+        #      所以必须手动把外层的开关同步到 text_config 上，否则权重绑定会静默失效 ——
+        #      表现为输出乱码但不报错，极难排查。
+        #
+        #      注意：不能用「text_config 是否已有该字段」来判断是否需要拷贝，
+        #      因为有些模型（存在纯文本版本时）本身就带这个字段，语义不同。
         if model_config.is_multimodal_model and hasattr(
             model_config.hf_config, "tie_word_embeddings"
         ):
@@ -994,10 +1161,17 @@ class VllmConfig:
             hf_config.get_text_config().tie_word_embeddings = tie_word_embeddings
 
         model_config.hf_config = hf_config
+        # [CN] hf_config 换了，架构相关的派生信息必须重算（层数、hidden size、注意力类型等缓存）
         model_config.model_arch_config = model_config.get_model_arch_config()
 
         return replace(self, model_config=model_config)
 
+    # [CN] 「仅在用户没显式设置时才填默认值」的辅助函数，是本文件默认体系的基石。
+    #
+    #      ⚠️ 判据是 `is None` 而不是「是否等于默认值」：
+    #      所以用户显式写 `False` / `0` / `[]` 都会被尊重，不会被默认值覆盖。
+    #      这就是为什么很多字段在 arg_utils 里被特意改成 `default=None` 当哨兵 ——
+    #      只有 None 才能区分「没设」和「设成假值」。
     def _set_config_default(self, config_obj: Any, key: str, value: Any) -> None:
         """Set config attribute to default if not already set by user.
 
@@ -1011,8 +1185,17 @@ class VllmConfig:
             # hard coded.
             # Other values depend on the user given configuration, so they are
             # implemented with lambda functions and decided at run time.
+            # [CN] value 可能是 lambda cfg: ... —— 需要依赖其他配置才能决定的值用可调用对象延迟求值，
+            #      这样默认值可以引用最终配置，而不是构造时的中间状态
             setattr(config_obj, key, value(self) if callable(value) else value)
 
+    # [CN] 按 optimization_level（O0/O1/O2/O3）批量套用默认值，见文件头的 OPTIMIZATION_LEVEL_* 表。
+    #
+    #      三个要点：
+    #      1) 只覆盖 defaults 里列出的字段，其余不动；
+    #      2) 递归下钻到嵌套 dataclass（如 compilation_config.cudagraph_mode）；
+    #      3) 由于走 _set_config_default，用户显式设置的值一律优先于 level 默认值。
+    #         即 level 只是"给没设的字段兜底"，不是强制覆盖。
     def _apply_optimization_level_defaults(self, defaults: dict[str, Any]) -> None:
         """Apply optimization level defaults using self as root.
 
@@ -1031,6 +1214,8 @@ class VllmConfig:
         def apply_recursive(config_obj: Any, config_defaults: dict[str, Any]) -> None:
             """Recursively apply defaults to config_obj, using self as root."""
             for key, value in config_defaults.items():
+                # [CN] 静默跳过不存在的字段：defaults 表是手写的，字段改名后不会报错，
+                #      只会悄悄失效——改配置字段名时记得同步 OPTIMIZATION_LEVEL_* 表
                 if not hasattr(config_obj, key):
                     continue
 
@@ -1042,6 +1227,14 @@ class VllmConfig:
 
         apply_recursive(self, defaults)
 
+    # [CN] 「动态投机解码」与「full CUDA graph」互斥，这里是自动降级。
+    #
+    #      原因：full cudagraph 要求每步的 shape 完全固定，而动态投机解码会在运行时
+    #      改变验证长度（num_speculative_tokens 随 batch 变化），shape 不再固定。
+    #      与其在运行时崩，不如在配置期降级为 PIECEWISE（分段捕获，只包住 attention 之外的部分）。
+    #
+    #      注意降级是**静默改配置 + 打一条 warning**，不会报错。排查性能问题时
+    #      如果看到 cudagraph_mode 和自己设的不一样，多半是这里动的。
     def _maybe_override_dynamic_sd_cudagraph_mode(self) -> None:
         speculative_config = self.speculative_config
         if (
@@ -1061,6 +1254,11 @@ class VllmConfig:
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+    # [CN] 动态投机解码与数据并行互斥，同样是自动降级（清掉 per-batch 表，退回静态 token 数）。
+    #
+    #      为什么必须禁：DP 下各个 rank 会**独立**决定本次用几个投机 token，
+    #      一旦不同步，各 rank 每步推进的 token 数就不一致 —— 轻则结果发散，
+    #      重则在需要集合通信的地方互相等待，直接死锁。这属于"必须保证同步"的硬约束。
     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
         speculative_config = self.speculative_config
         if (
@@ -1092,10 +1290,15 @@ class VllmConfig:
 
         kv_offloading_backend = self.cache_config.kv_offloading_backend
 
+        # [CN] 反向依赖：用户在 CacheConfig 上只填了 kv_offloading_size，
+        #      但真正干活的是 KVTransferConfig。这里把它补全 ——
+        #      也就是说「开启 KV offload」这个开关在 CacheConfig，而实现载体在 KVTransferConfig。
         # If no KVTransferConfig is provided, create a default one.
         if self.kv_transfer_config is None:
             self.kv_transfer_config = KVTransferConfig()
 
+        # [CN] native 走 vLLM 自带的 CPU offload connector，cpu_bytes_to_use 单位是字节，
+        #      所以要把用户给的 GiB 乘 1<<30。两种实现：Simple（简化版）/ Offloading（完整版）。
         if kv_offloading_backend == "native":
             if envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
                 config_connector = "SimpleCPUOffloadConnector"
@@ -1114,6 +1317,8 @@ class VllmConfig:
             self.kv_transfer_config.kv_connector = "LMCacheMPConnector"
 
         # This is the same for all backends
+        # [CN] kv_both = 本进程既能当 sender 又能当 receiver。
+        #      offload 场景（把 KV 卸到本地 CPU）本来就是单机自收自发，所以固定为 both。
         self.kv_transfer_config.kv_role = "kv_both"
 
     def _verify_kv_transfer_compat(self) -> None:
@@ -1143,6 +1348,10 @@ class VllmConfig:
             "PYTORCH_CUDA_ALLOC_CONF", ""
         ):
             return
+        # [CN] 唯一的例外：开了 cumem allocator。
+        #      它会在自己的内存池作用域内临时关掉 expandable_segments，
+        #      于是 KV cache 落在稳定的物理页上，不会重映射 —— 所以放行。
+        #      这也是为什么开 sleep mode 能顺带解决这个冲突（sleep mode 会启用 cumem）。
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
             return
 
@@ -1184,6 +1393,9 @@ class VllmConfig:
                 "are normalized over the same nucleus as the sampling mask"
             )
 
+    # [CN] trace replay = 回放真实线上 trace（用于确定性复现/性能压测）。
+    #      只支持 V2 runner，也是"能力未就绪就直接报错"而非静默降级的例子。
+    #      与上面的 sampling replay 区别在于：它校验的是功能开关组合，而非采样语义一致性。
     def _verify_trace_replay_config(self) -> None:
         model_config = self.model_config
         if model_config is None or not model_config.enable_trace_replay:
@@ -1191,10 +1403,27 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    # [CN] ======================= 全文件最重要的一个方法 =======================
+    #      __post_init__ 是「配置从『用户意图』变成『可执行事实』」的那一步。
+    #      它做三件事，且**会就地修改**子配置对象：
+    #
+    #      (1) 推导默认值    —— 把 arg_utils 留下的 None 哨兵填上真实值
+    #                          （max_num_batched_tokens、cudagraph sizes、compile ranges ...）
+    #      (2) 跨配置联合校验 —— 单个子配置各自合法、组合起来非法的情形，只能在这里拦
+    #                          （投机解码 vs DP、KV connector vs expandable_segments ...）
+    #      (3) 自动降级      —— 不兼容的开关组合直接改写为安全值 + warning，而不是报错
+    #
+    #      ⚠️ 阅读提示：
+    #      - 顺序即依赖。后面的校验常常假设前面的推导已完成，不要随意调整语句顺序。
+    #      - 大量 `if X is not None` 是防御性的：VllmConfig 允许被部分构造
+    #        （如只为算 hash 而造的临时实例），此时子配置可能是 None。
+    #      - 这个方法只在启动时跑一次，里面出现的 O(1) 之外的循环/IO 都是启动耗时来源。
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
         # To give each torch profile run a unique instance name.
+        # [CN] 用纳秒时间戳当实例 ID：目的是让同一次进程内的多次 torch profile
+        #      输出到不同目录，互不覆盖。不是稳定的业务 ID，别拿它做持久化标识。
         self.instance_id = f"{time.time_ns()}"
 
         self._resolve_mm_encoder_only()
@@ -1262,6 +1491,11 @@ class VllmConfig:
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 
+        # [CN] NIXL（PD 分离的 RDMA 传输后端）对并行方式有三条硬约束，全部用 assert 而非 ValueError：
+        #      因为这些属于"内部不可能出现"的不变量（上游 executor 会保证），
+        #      真触发说明是代码 bug 而非用户配错，所以不给友好提示。
+        #      约束含义：NIXL 侧要么完整复制、要么按 TP 粒度分片，不能是任意 DCP 值；
+        #      且 >1 的分片只对 MLA 模型成立（Mamba/混合架构不支持）。
         # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
         if (
             self.kv_transfer_config is not None
@@ -1301,6 +1535,9 @@ class VllmConfig:
                 "`--enable-mamba-cache-stochastic-rounding`."
             )
 
+        # [CN] 这里用的是**不带深拷贝**的 _ 版本，所以有可能就地修改 model_config。
+        #      在 __post_init__ 里这是可接受甚至必要的（需要把量化参数写回 model_config）；
+        #      而在 get_quantization_config（对外版）里就必须拷贝，见那里的说明。
         if self.quant_config is None and self.model_config is not None:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
@@ -1339,6 +1576,9 @@ class VllmConfig:
         from vllm.v1.executor.abstract import Executor
 
         executor_backend = self.parallel_config.distributed_executor_backend
+        # [CN] 注意 Executor.get_class(self) 需要完整的 VllmConfig —— 说明 executor 的选择
+        #      依赖模型/并行/调度等多维信息，不只是 distributed_executor_backend 一个字符串。
+        #      这也是为什么 executor 相关校验只能放在 __post_init__ 里。
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
@@ -1347,6 +1587,15 @@ class VllmConfig:
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
+        # [CN] async_scheduling 是**三态**布尔（None / True / False），语义完全不同：
+        #        None  = 用户没表态 → 自动决定（下面 elif 分支）：能用就开，有冲突就静默关 + warning
+        #        True  = 用户显式要求 → 硬失败：有任何不兼容直接 ValueError，不降级
+        #        False = 用户显式关闭 → 下面两个分支都不进
+        #      这种"显式则报错、未指定则降级"的模式在 vLLM 配置里反复出现，
+        #      是它区别于普通参数解析框架的一个设计取向：把决定权交给用户，但默认给可用解。
+        #
+        #      async scheduling 本身：让调度与模型执行重叠（CPU 调度下一步时 GPU 还在跑当前步），
+        #      属于吞吐优化；代价是对投机解码、executor、DBO 都有约束。
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -1429,6 +1678,9 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        # [CN] DP 同步是否走 NCCL：开启 async scheduling 时改成不用 NCCL。
+        #      原因：NCCL 集合通信会同步阻塞，与 async scheduling 想达成的"CPU/GPU 重叠"相冲突；
+        #      改用基于 ZMQ 的轻量同步。同样只在未显式指定时才自动决定。
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
                 if self.parallel_config.data_parallel_size > 1 and (
@@ -1486,6 +1738,9 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        # [CN] enforce_eager 是"一键关掉所有编译优化"的总闸。
+        #      注意它连带关掉两项：torch.compile(mode) 与 CUDA graph(cudagraph_mode)。
+        #      调试时很好用（报错栈可读、启动快），但性能差距巨大，别在生产误开。
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning_once(
                 "Enforce eager set, disabling torch.compile and CUDAGraphs. "
@@ -1494,6 +1749,9 @@ class VllmConfig:
             self.compilation_config.mode = CompilationMode.NONE
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # [CN] Proton profiler 要求关掉 CUDA graph —— 因为 graph 会把 kernel 序列
+        #      "固化"成一个整体 launch，导致 profiler 拿不到逐 kernel 的时间线。
+        #      这条是硬失败（用户显式开了 profiler 就必须能采到数据，降级没意义）。
         if self.profiler_config.profiler == "proton":
             if not current_platform.is_cuda():
                 raise ValueError(
@@ -1528,6 +1786,8 @@ class VllmConfig:
                 "inductor compilation will be ignored."
             )
 
+        # [CN] 局部辅助函数：判断当前量化方法是否使用「分块权重」（block-wise 量化）。
+        #      两种量化实现暴露的查询接口不同（一个属性、一个方法），这里做兼容适配。
         def has_blocked_weights():
             if self.quant_config is not None:
                 if hasattr(self.quant_config, "weight_block_size"):
@@ -1540,13 +1800,19 @@ class VllmConfig:
         # On H100 the CUDA kernel is faster than
         # native implementation
         # https://github.com/vllm-project/vllm/issues/25094
+        # [CN] 分块 FP8 权重量化 → 强制开启 quant_fp8 自定义 CUDA op。
+        #      custom_ops 用 "+/- 前缀"表达增删，且**后面的覆盖前面的**（类似有序列表），
+        #      所以这里先检查是否已被显式 "-quant_fp8" 关掉，再决定要不要追加 "+quant_fp8"。
         if has_blocked_weights():
             custom_ops = self.compilation_config.custom_ops
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
 
+        # [CN] 平台相关的兜底默认值（ROCm/TPU/CPU 各自覆盖一批字段）。
+        #      放在所有通用逻辑之后，保证平台默认值只填"仍然为 None"的坑。
         current_platform.apply_config_platform_defaults(self)
 
+        # [CN] 编译模式默认值：O0 不编译，O1+ 走 vLLM 自己的编译流水线
         if self.compilation_config.mode is None:
             if self.optimization_level > OptimizationLevel.O0:
                 self.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -1560,6 +1826,10 @@ class VllmConfig:
                 and self.compilation_config.backend == "inductor"
             )
 
+        # [CN] custom_ops 的默认值分两种取向，取决于是否走 Inductor：
+        #        - inductor 后端：默认 "none"（关闭自定义 op，让 Inductor 自己做融合）
+        #        - 其他后端：默认 "all"（没有 Inductor 兜底，需要自定义 op 保证性能）
+        #      已显式写了 all/none 的则不覆盖。
         if all(s not in self.compilation_config.custom_ops for s in ("all", "none")):
             if (
                 self.compilation_config.backend == "inductor"
@@ -1574,8 +1844,12 @@ class VllmConfig:
         # but before fusion defaults are applied as those may depend on op priority.
         self.kernel_config.set_platform_defaults(self)
 
+        # [CN] 按 optimization_level（O0~O3）套用那张预设默认值表。
+        #      必须放在 mode / backend 决定之后 —— 因为表里可能有依赖它们的 lambda。
         default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]
         self._apply_optimization_level_defaults(default_config)
+        # [CN] 这里是个自检：表必须覆盖这个字段，否则说明 OPTIMIZATION_LEVEL_* 表写漏了。
+        #      用 ValueError 而不是 assert，因为 assert 可能被 -O 去掉。
         if self.kernel_config.enable_flashinfer_autotune is None:
             raise ValueError(
                 "KernelConfig.enable_flashinfer_autotune must be set after applying "
@@ -1598,6 +1872,8 @@ class VllmConfig:
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # [CN] 序列并行（SP）的依赖关系：fuse_gemm_comms（async TP）建立在 SP 之上，
+        #      所以开了前者必须强制开后者。
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
         if pass_config.fuse_gemm_comms:
@@ -1632,6 +1908,9 @@ class VllmConfig:
 
         from vllm.utils.torch_utils import HAS_OPAQUE_TYPE
 
+        # [CN] fast_moe_cold_start 是 MoE 冷启动加速：首轮跳过部分编译/初始化以尽快出 token。
+        #      风险点：如果投机解码的 draft 模型也带 MoE，冷启动路径可能对不上 → 默认关。
+        #      另外 torch>=2.11 有了更好的实现，直接废弃开关。
         if HAS_OPAQUE_TYPE:
             # On torch >= 2.11 the hoisted OpaqueObject approach supersedes
             # fast_moe_cold_start, so force it off.
@@ -1644,8 +1923,14 @@ class VllmConfig:
                 self.speculative_config is None
             )
 
+        # [CN] 关键推导之一：根据 max_num_batched_tokens / chunked prefill / 投机解码 等，
+        #      算出每步最多调度多少 token。放在这里是因为它依赖前面已定稿的多个开关。
         self._set_max_num_scheduled_tokens()
 
+        # [CN] ---- CUDA graph 的三轮降级 ----
+        #      顺序很重要：先按模型类型降级（pooling / encoder-decoder），
+        #      再按 KV connector 要求降级，最后按 enforce_eager 直接关掉。
+        #      所以你最终看到的 cudagraph_mode 可能和你设的差好几级。
         if current_platform.support_static_graph_mode():
             # if cudagraph_mode has full cudagraphs, we need to check support
             if model_config := self.model_config:
@@ -1709,11 +1994,16 @@ class VllmConfig:
             else:
                 self.compilation_config.cudagraph_num_of_warmups = 1
 
+            # [CN] 决定要捕获哪些 batch size 的 CUDA graph（显存与覆盖率的权衡）
             self._set_cudagraph_sizes()
 
         else:
+            # [CN] 平台不支持静态图（如某些 CPU / 未适配的加速器）→ 整体关掉
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # [CN] kv_sharing_fast_prefill 与 EAGLE 互斥（硬失败）：
+        #      fast prefill 会跳过部分 prompt token 的 logits 计算，
+        #      而 EAGLE 需要每个位置的准确 logits 来做 draft/verify。
         if self.cache_config.kv_sharing_fast_prefill:
             if (
                 self.speculative_config is not None
@@ -1763,12 +2053,16 @@ class VllmConfig:
                 "Modify KVEventsConfig.enable_kv_cache_events "
                 "to True to enable."
             )
+        # [CN] 平台最后一道"检查并改写"（与前面的 apply_config_platform_defaults 呼应：
+        #      那个填默认值，这个做平台专属的合法性检查与修正）
         current_platform.check_and_update_config(self)
 
         self._resolve_allow_missing_mm_embeddings()
         self._resolve_mm_processor_device()
         self._validate_mm_processor_device()
 
+        # [CN] V1 / V2 两套 model runner 各自有一份"不支持特性清单"，
+        #      在这里集中比对并报错。新增特性时必须同步这两份清单，否则会漏检。
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()
         else:
@@ -1777,6 +2071,8 @@ class VllmConfig:
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()
 
+        # [CN] 编译范围要**重算**：平台层刚才可能改了 max_num_batched_tokens 等上游量，
+        #      所以编译范围必须在平台更新之后、而不是之前确定。这是一处典型的顺序依赖。
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
         self._set_compile_ranges()
@@ -1816,6 +2112,9 @@ class VllmConfig:
                         "pipeline parallelism",
                     )
 
+        # [CN] cudagraph 的**最终一致性检查**（所有降级都跑完之后）。
+        #      这里的 assert 表达的是不变量：PIECEWISE 模式必然要求走 vLLM 编译流水线，
+        #      否则前面的降级逻辑有 bug。
         # final check of cudagraph mode after all possible updates
         if current_platform.is_cuda_alike():
             if (
@@ -1868,6 +2167,8 @@ class VllmConfig:
                 self.model_config.disable_cascade_attn = True
                 logger.warning_once("Disabling cascade attention when DBO is enabled.")
 
+        # [CN] 兜底：如果时间戳为空（理论上不会），用随机 UUID 前 5 位。
+        #      说明 instance_id 只要求"唯一"，不要求"可读/稳定"。
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]
 
@@ -1894,6 +2195,17 @@ class VllmConfig:
             )
             self.cache_config.enable_prefix_caching = False
 
+        # [CN] 混合 KV cache 管理器（HMA）：统一管理 attention 的 KV cache 与 Mamba/SSM 的 state cache。
+        #      是否启用是**三态**（None 自动 / False 显式开 / True 显式关），规则如下：
+        #        None  → 平台不支持、或命中已知不兼容组合（chunked local attn、不支持 HMA 的
+        #                KV connector）时自动关；否则默认开
+        #        False → 用户显式要求开，但运行时发现不兼容 → **报错**（尊重用户意图，不静默降级）
+        #        True  → 用户显式关，永远尊重
+        #      影响面：混合 SSM 模型（Jamba/Bamba）**必须**有 HMA 否则起不来；
+        #      滑动窗口模型没有 HMA 只是性能下降。
+        #
+        #      注意下面收集 need_disable 的过程是"累加或"：多个条件任一命中就关，
+        #      且为了避免误报，warning 延后打印（此时还不知道模型是否真的是 hybrid）。
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
         #   disables it
@@ -1967,6 +2279,8 @@ class VllmConfig:
             # Default to enable HMA if not explicitly disabled by user or logic above.
             self.scheduler_config.disable_hybrid_kv_cache_manager = False
 
+        # [CN] debug dump 路径：两者都设时**环境变量优先**并覆盖配置值。
+        #      这与多数配置"显式参数 > 环境变量"的优先级相反，是一个例外，值得留意。
         if self.compilation_config.debug_dump_path:
             self.compilation_config.debug_dump_path = (
                 self.compilation_config.debug_dump_path.absolute().expanduser()
@@ -1994,6 +2308,9 @@ class VllmConfig:
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 
+    # [CN] 开启序列并行后，batch size 必须能被 tp_size 整除（否则序列无法均分到各 TP rank）。
+    #      这里把候选 size 里不整除的剔除，并打印被剔除的列表——方便用户理解
+    #      "为什么某些 batch size 拿不到 CUDA graph"。
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when
         # enable sequence parallelism
@@ -2017,6 +2334,19 @@ class VllmConfig:
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
 
+    # [CN] 只在启用投机解码时才需要调整。
+    #
+    #      背景：投机解码时一次 forward 要同时容纳「被验证的 token」+「新草稿 token」，
+    #      所以每步实际调度的 token 上限会比 max_num_batched_tokens 少一部分 ——
+    #      少掉的这部分就是 scheduled_token_delta（草稿额外占用的槽位）。
+    #
+    #      两个报错点：
+    #        - max_num_scheduled_tokens <= 0：max_num_batched_tokens 太小，连一个 token 都排不下
+    #        - max_num_batched_tokens <= delta：预算被草稿槽位吃光
+    #      还有一条 8192 的性能提醒（低于此值吞吐会明显下降）。
+    #
+    #      ⚠️ 注意这里改的是 scheduler_config.max_num_scheduled_tokens，
+    #      而 max_num_batched_tokens 保持不变 —— 二者是不同的量。
     def _set_max_num_scheduled_tokens(self):
         """
         In most cases, the scheduler may schedule a batch with as many tokens as the
@@ -2056,6 +2386,23 @@ class VllmConfig:
                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
                 )
 
+    # [CN] 【CUDA graph 捕获尺寸的决策逻辑 —— 显存与覆盖率的权衡核心】
+    #
+    #      默认候选列表的形状（见下方英文 docstring）：
+    #        [1, 2, 4] + 8 的倍数到 256 + 16 的倍数到 max_graph_size
+    #      即**小 batch 密、大 batch 疏**：小 batch 出现频率高、且绝对填充浪费小，
+    #      值得逐个捕获；大 batch 用 16 的步长，靠"向上取整到最近的已捕获尺寸"来复用。
+    #
+    #      运行时的匹配规则（务必记住）：
+    #        - batch <= 某个已捕获尺寸 → 向上补齐(pad)到最近的尺寸，用对应 graph
+    #        - batch > 最大已捕获尺寸 → **完全不用 CUDA graph**，退回 eager
+    #      所以 max_cudagraph_capture_size 设太小会导致大 batch 直接失去图优化。
+    #
+    #      显存代价：每个尺寸都要一份独立的 graph 副本，尺寸数量直接线性影响显存。
+    #
+    #      投机解码的特殊处理：一次 decode 每请求是 decode_query_len 个 token（>1），
+    #      这时不能按 token 数建网格（会产生几百个尺寸且多数不可用，
+    #      因为 dispatch 要求恰好是 query_len 的倍数），改为按**请求数**建网格。
     def _set_cudagraph_sizes(self):
         """
         vLLM defines the default candidate list of batch sizes for CUDA graph
@@ -2208,6 +2555,8 @@ class VllmConfig:
                             if n * query_len <= max_cudagraph_capture_size
                         }
                     )
+            # [CN] 用 max_num_batched_tokens 再夹一次上界：
+            #      超过它的尺寸运行时根本不会出现，捕获了纯属浪费显存。
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
@@ -2230,6 +2579,10 @@ class VllmConfig:
                 # sort to make sure the sizes are in ascending order
                 cudagraph_capture_sizes.sort()
             else:
+                # [CN] performance_mode 的两种取向：
+                #        interactivity（低延迟优先）：1..32 **逐个**捕获，padding 浪费最小
+                #        balanced / throughput：走下面的 [1,2,4]+步长8+步长16 稀疏网格，省显存
+                #      这是"延迟 vs 显存"的显式取舍点。
                 if self.performance_mode == "interactivity":
                     # Fine-grained CUDA graphs at small batch sizes
                     # for minimal padding overhead
@@ -2325,6 +2678,17 @@ class VllmConfig:
         # complete the remaining process.
         self.compilation_config.post_init_cudagraph_sizes()
 
+    # [CN] 编译范围（compile ranges）= 需要为哪些 token 数量区间各编译一份特化代码。
+    #
+    #      为什么需要：某些融合算子（如 allreduce+rms_norm 融合、序列并行的切分）
+    #      只在 token 数处于特定范围内才成立/才划算。于是把 [0, max_num_batched_tokens]
+    #      切成若干段，每段编译一份。
+    #
+    #      这里的"端点"来自三个来源，逐个 append：
+    #        1. max_num_batched_tokens（总上界）
+    #        2. allreduce-rms 融合的可用上限（受通信 buffer 大小限制，按 hidden_size×dtype 换算成 token 数）
+    #        3. 序列并行的 min/max token 阈值
+    #      最后交给 compilation_config 排序去重成实际区间。
     def _set_compile_ranges(self):
         """
         Set the compile ranges for the compilation config.
@@ -2435,6 +2799,16 @@ class VllmConfig:
             computed_compile_ranges_endpoints
         )
 
+    # [CN] 「按架构定制配置」的钩子入口。
+    #
+    #      设计动机：某些模型的特殊需求（如 Jamba 的 Mamba 块尺寸、DeepSeek 的 MLA 参数）
+    #      不适合写死在通用配置里，于是允许每个架构注册一个 MODELS_CONFIG_MAP 条目，
+    #      在这里回调它的 verify_and_update_config(self) —— 可以**就地修改整个 VllmConfig**。
+    #
+    #      这是 vLLM 配置体系里少见的"模型反向修改全局配置"的路径，
+    #      排查"我的配置怎么被改了"时要想到这里。
+    #
+    #      config_updated 标志：防止重复执行（VllmConfig 可能被多次构造/派生）。
     def try_verify_and_update_config(self):
         if self.model_config is None:
             return
@@ -2497,6 +2871,8 @@ class VllmConfig:
                     f"Model: {self.model_config.model}"
                 )
 
+    # [CN] 编译调试产物按 rank 分目录：多进程编译会各自 dump 一大堆文件，
+    #      混在一个目录里无法分辨。命名包含 TP rank 与 DP index 两层。
     def compile_debug_dump_path(self) -> Path | None:
         """Returns a rank-aware path for dumping
         torch.compile debug information.
@@ -2509,6 +2885,9 @@ class VllmConfig:
         path = self.compilation_config.debug_dump_path / append_path
         return path
 
+    # [CN] 注意 __str__ 只是**信息性**的，且只挑选了最常用的字段。
+    #      它不等于序列化（序列化走 msgspec/json），也不保证覆盖所有配置。
+    #      日志里看到的配置摘要来自这里，改动字段时记得同步。
     def __str__(self):
         return (
             f"model={self.model_config.model!r}, "
@@ -2563,6 +2942,9 @@ class VllmConfig:
 
         ec_config = self.ec_transfer_config
         kv_config = self.kv_transfer_config
+        # [CN] ⚠️ 这里是**无条件覆盖**，不尊重用户手设的值。
+        #      因为它是从 EC/KV 的 consumer 角色推导出来的事实，不是偏好；
+        #      手设成 True 但本实例不是 consumer 的话，会导致真正缺 tensor 时漏报错。
         # Derived, so overwrite unconditionally rather than honouring a value
         # that was set by hand.
         mm_config.allow_missing_mm_embeddings = (
@@ -2588,6 +2970,15 @@ class VllmConfig:
             )
         mm_config.mm_encoder_only = True
 
+    # [CN] `--mm-processor-device=auto` 的最终判定，判定条件比字面意思严格得多：
+    #      "auto" 不等于"有加速器就用加速器"，而是同时满足：
+    #        ① 本实例是 EC encode-only（只跑编码器，不跑 forward、不占 KV cache）
+    #           → 加速器空闲，前端预处理可以独占
+    #        ② 张量传输方式是 torch_shm
+    #           → 否则输出要先拷回 host 再序列化，拷贝开销反而大于在设备上跑的收益
+    #      两个条件任一不满足就留在 CPU。这也是"为什么我开了 auto 却还在 CPU 上"的答案。
+    #
+    #      注意：用户显式指定的设备在这里**不动**，留到 _validate_mm_processor_device 校验。
     def _resolve_mm_processor_device(self) -> None:
         """Settle `--mm-processor-device=auto` now that the EC role is known.
 
@@ -2655,6 +3046,9 @@ class VllmConfig:
 
         mm_config.validate_mm_processor_device(self.ec_transfer_config)
 
+    # [CN] V1 / V2 两套 model runner 各自维护一份"不支持特性清单"，
+    #      以字符串列表的形式收集后统一报错。好处是所有不兼容项**一次性**列全，
+    #      用户不必逐个试错。代价是新增特性时要记得往这两份清单里加。
     def _get_v2_model_runner_unsupported_features(self) -> list[str]:
         """Collect features not yet supported by the V2 model runner."""
         unsupported: list[str] = []
@@ -2707,6 +3101,10 @@ class VllmConfig:
         if self.parallel_config.enable_elastic_ep:
             unsupported.append("elastic expert parallelism")
 
+        # [CN] 自定义 logits processors 有两种来源，都要拦：
+        #        ① 配置里显式给的 model_config.logits_processors
+        #        ② 通过 setuptools entry_points 注册的插件（"vllm.logits_processors" 组）
+        #      只查①会漏掉以插件形式安装的第三方 logits processor。
         has_logitsproc_plugins = False
         if model_config is not None:
             from importlib.metadata import entry_points
@@ -2789,6 +3187,12 @@ class VllmConfig:
                 "with pipeline parallelism"
             )
 
+    # [CN] batch-sharded sampling：把采样计算也按 TP 分片（每 rank 只算自己那段 logits 的采样）。
+    #      优化目标是省掉采样前的 logits all-gather。
+    #
+    #      这里收集 blockers（而非遇到第一个就报错）的好处：一次性列出所有原因，
+    #      避免用户改一个再报下一个。注意只有**显式开启**才校验——
+    #      未指定时直接置 False（这里把 None 收敛成布尔，供下游无判空使用）。
     def _validate_batch_sharded_sampling(self) -> None:
         """Validate `enable_batch_sharded_sampling` against the rest of the config."""
         if not self.parallel_config.enable_batch_sharded_sampling:
@@ -2854,6 +3258,9 @@ class VllmConfig:
         # TODO: DBO with model runner V2 is under development.
         # It should be enabled with explicit VLLM_USE_V2_MODEL_RUNNER environ.
         # Remove it when stable.
+        # [CN] 注意这个早退：DBO+V2 还在开发中，**必须显式设置** VLLM_USE_V2_MODEL_RUNNER
+        #      才继续往下检查；未设置时无条件判为不支持（返回固定的一项）。
+        #      即"默认不开放，需要用户主动声明我要用实验特性"。
         if envs.VLLM_USE_V2_MODEL_RUNNER is None:
             return ["dual batch overlap"]
 
@@ -2981,6 +3388,16 @@ class VllmConfig:
                 "in the middle of a mm input"
             )
 
+    # [CN] 下面几个是 pydantic 的 model_validator(mode="after")，与 __post_init__ 的区别：
+    #      - __post_init__ 是 dataclass 钩子，只跑一次、可以任意改写字段
+    #      - model_validator(mode="after") 是 pydantic 钩子，必须**返回 self**，
+    #        且会在每次 pydantic 校验时跑（含反序列化场景）
+    #      两者并存是因为 VllmConfig 用了 pydantic dataclass：既有 dataclass 的
+    #      字段与默认值机制，又想借用 pydantic 的校验/序列化能力。
+    #
+    #      nvfp4 与 MLA 不兼容：MLA 的 latent 维度是 head_size 的特殊布局，
+    #      普通 nvfp4 布局（head_size//2 + head_size//16）套不上；
+    #      要用得选专门的 nvfp4_ds_mla 布局。
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
@@ -3008,6 +3425,9 @@ class VllmConfig:
             self.cache_config.mamba_block_size is not None
             and self.cache_config.mamba_block_size != self.model_config.max_model_len
         )
+        # [CN] mamba_block_size 只有在开启 prefix caching 时才有意义：
+        #      Mamba 是状态递推模型，要能复用中间状态就必须按块对齐缓存，
+        #      而这正是 prefix caching 提供的机制。没开的话设置它没有任何效果，直接报错。
         if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:
             raise ValueError(
                 "--mamba-block-size can only be set with --enable-prefix-caching"
@@ -3086,10 +3506,28 @@ class VllmConfig:
         return self
 
 
+# [CN] ===== 模块级「当前配置」全局变量 =====
+#      这是一个典型的"环境式上下文"（ambient context）：
+#      模型初始化期间把 VllmConfig 挂到全局变量上，让**深层自定义算子**
+#      不必层层透传配置就能读到（如 CustomOp 需要按 dtype/平台决定走哪条 kernel）。
+#
+#      代价与风险：
+#      - 隐式依赖：读配置的代码看不出配置从哪来，测试/离线场景容易漏设置
+#      - 非线程安全：多线程同时初始化不同模型会互相覆盖（所以它是栈式保存/恢复的）
+#      因此 vLLM 只在「模型初始化」这个明确窗口内使用它，不扩散到推理主循环。
+#
+#      _current_prefix 用于多模型场景（如投机解码的 draft 模型）区分命名空间。
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None
 
 
+# [CN] 上下文管理器：进入时设置、退出时**恢复上一个**配置（栈式）。
+#      两个隐蔽但重要的细节：
+#      1) 进出都要 get_cached_compilation_config.cache_clear() ——
+#         否则上一份配置下的编译配置会被 lru_cache 缓存住，换模型后读到旧的
+#      2) check_compile 会对比 compilation_counter.num_models_seen 前后变化，
+#         没增加说明该模型**没有** @support_torch_compile 装饰器、
+#         即"开了编译但模型不支持"，只能给 warning（不能报错，否则不支持编译的模型全挂）
 @contextmanager
 def set_current_vllm_config(
     vllm_config: VllmConfig, check_compile=False, prefix: str | None = None
@@ -3151,6 +3589,10 @@ def get_cached_compilation_config():
     return get_current_vllm_config().compilation_config
 
 
+# [CN] 与 get_current_vllm_config_or_none() 的区别：这里**明确报错**而不是返回 None。
+#      因为绝大多数调用方拿到 None 也无法处理，早失败好过后面出诡异空指针。
+#      错误信息里特别提示了两种常见触发场景（在上下文外调用 / 在 import 期实例化 CustomOp），
+#      这是排障时的关键线索。
 def get_current_vllm_config() -> VllmConfig:
     if _current_vllm_config is None:
         raise AssertionError(

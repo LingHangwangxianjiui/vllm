@@ -455,6 +455,11 @@ class Request:
         return events
 
     def take_prefill_stats(self) -> PrefillStats | None:
+        """取走并清空 prefill 阶段统计（同样是 take 语义，取一次即置 None）。
+
+        只在开启 prefill 细粒度统计时才非 None；否则整个字段一直是 None，
+        这里也就一直返回 None —— 属于"零开销的可选统计"。
+        """
         if self.prefill_stats is None:
             return None
         prefill_stats = self.prefill_stats
@@ -465,6 +470,14 @@ class Request:
         """
         Compare two requests based on priority, arrival time, and request ID.
         Used in priority scheduling.
+
+        中文：三级排序键，依次是 priority → arrival_time → request_id。
+          - priority：**数值越小越优先**（与常见的"数字大优先级高"相反，容易记反）；
+          - arrival_time：先到先服务，是 FCFS 策略的基础；
+          - request_id：字符串比较，仅用于打平前两级后保证排序稳定；
+          - 最后 `id(self) < id(other)` 是兜底：连 request_id 都相同时用对象地址，
+            避免同一 request_id 被复用（如流式会话）时出现不确定排序。
+        只实现了 __lt__，配合 functools / heapq 即可得到最小堆语义（优先级最高者在堆顶）。
         """
         if self.priority != other.priority:
             return self.priority < other.priority
@@ -475,6 +488,14 @@ class Request:
         return id(self) < id(other)
 
 
+# [CN] RequestStatus 补充：用 IntEnum 而非 Enum，是为了让 `status > PREEMPTED`
+# 这种**按数值比较**的终态判定成立（见 is_finished）。
+#
+# ⚠️ 顺序即语义，不能随意调整：
+#    - WAITING ~ PREEMPTED 这一段是"未完成"状态；
+#    - 排在 PREEMPTED 之后的**全部**被视为终态（判据就是 status > PREEMPTED）。
+#    因此：新增非终态状态必须插在 PREEMPTED 之前，新增终态才能追加到末尾。
+#    各状态含义与迁移条件见文件头「请求状态机」一节。
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
 
@@ -494,14 +515,17 @@ class RequestStatus(enum.IntEnum):
     FINISHED_REPETITION = enum.auto()
 
     def __str__(self) -> str:
+        # 返回枚举名（如 "RUNNING"）而非数值，方便日志阅读。
         return self.name
 
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
+        # 终态判据：数值大于 PREEMPTED。依赖枚举的声明顺序，见类 docstring。
         return status > RequestStatus.PREEMPTED
 
     @staticmethod
     def get_finished_reason(status: "RequestStatus") -> FinishReason | None:
+        # 非终态（不在映射表里）返回 None；调用方通常配合 is_finished() 先判一次。
         return _FINISHED_REASON_MAP.get(status)
 
 
@@ -509,6 +533,12 @@ class RequestStatus(enum.IntEnum):
 # NOTE: The ignored requests are the requests whose prompt lengths
 # are longer than the model's length cap. Therefore, the stop
 # reason should also be "length" as in OpenAI API.
+# 中文：把引擎内部状态翻译成 OpenAI 兼容的 finish_reason。
+#   注意两点：
+#   1) FINISHED_IGNORED 映射成 LENGTH（而不是"忽略"）——被忽略的请求都是
+#      prompt 超过模型长度上限的，对客户端而言等价于"超长截断"；
+#   2) WAITING_FOR_STREAMING_REQ 也映射成 STOP —— 流式会话等待下一轮输入时，
+#      对前端来说这一轮已经正常结束了（不是错误）。
 _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,

@@ -553,49 +553,98 @@ class EngineArgs:
     """Arguments for vLLM engine."""
 
     # ---------------- 模型与 tokenizer（对应 ModelConfig / LoadConfig） ----------------
+    # [CN] model：HF Hub 上的 repo id，或本地模型目录路径。整个 vLLM 的入口参数。
     model: str = ModelConfig.model
+    # [CN] MoE 专用：把每层实际路由到的专家 id 一并返回（用于分析路由分布/负载均衡）。
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
+    # [CN] 返回采样时实际生效的 mask（如结构化输出的 logits mask），调试用。
     return_sampling_mask: bool = ModelConfig.return_sampling_mask
+    # [CN] 权重路径可与 model（配置路径）分离，用于"配置取自 A、权重来自 B"的场景。
     model_weights: str = ModelConfig.model_weights
+    # [CN] 对外暴露的模型名（OpenAI API 请求里的 `model` 字段），可给多个别名。
+    #      它与 model 无关——请求中填的名字要匹配这里，而不是 HF repo id。
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
+    # [CN] None 表示与 model 同路径；显式指定用于"权重与 tokenizer 不同源"。
     tokenizer: str | None = ModelConfig.tokenizer
+    # [CN] None 同 model；用于本地权重目录缺少 config.json 时另行指定配置来源。
     hf_config_path: str | None = ModelConfig.hf_config_path
+    # [CN] runner 决定引擎"干什么"：generate(生成) / pooling(嵌入、分类) / diffusion。
+    #      auto 时由模型的 HF config 推断；选错会导致后续所有接口报类型不匹配。
     runner: RunnerOption = ModelConfig.runner
+    # [CN] 加载时对权重做在线格式转换（如把某些 HF 量化格式转成 vLLM 内部格式）。
     convert: ConvertOption = ModelConfig.convert
+    # [CN] 完全不加载 tokenizer：输入必须是已 tokenize 的 id 列表，可省启动时间与内存。
     skip_tokenizer_init: bool = ModelConfig.skip_tokenizer_init
+    # [CN] 允许直接用 embedding 向量当 prompt（跳过 tokenize + embed），用于 RLHF 等场景。
     enable_prompt_embeds: bool = ModelConfig.enable_prompt_embeds
+    # [CN] tokenizer_mode 可为 "auto"/"slow"/"mistral" 等内置值，也允许填自定义插件名。
     tokenizer_mode: TokenizerMode | str = ModelConfig.tokenizer_mode
+    # [CN] 执行 HF 仓库中的自定义 modeling 代码——存在远程代码执行风险，仅在信任来源时开启。
     trust_remote_code: bool = ModelConfig.trust_remote_code
+    # [CN] 多模态安全边界：允许读取本地媒体文件的目录白名单。空串表示不限制。
     allowed_local_media_path: str = ModelConfig.allowed_local_media_path
+    # [CN] 允许拉取远程媒体的域名白名单；None 表示不限制。
+    #      线上服务务必收紧这两项，否则可能被诱导读取/请求任意本地文件与内网地址（SSRF）。
     allowed_media_domains: list[str] | None = ModelConfig.allowed_media_domains
+    # [CN] 权重下载缓存目录；None 用 HF 默认缓存。离线环境常配合 HF_HUB_OFFLINE 使用。
     download_dir: str | None = LoadConfig.download_dir
+    # [CN] safetensors 的加载/预取策略；None 表示自动选择。
     safetensors_load_strategy: SafetensorsLoadStrategy | None = (
         LoadConfig.safetensors_load_strategy
     )
+    # [CN] 预取线程数与块大小，只在使用 safetensors 预取（本地盘/网络盘）时生效。
+    #      调大能加快大模型加载，代价是额外的内存与 IO 占用。
     safetensors_prefetch_num_threads: int = LoadConfig.safetensors_prefetch_num_threads
     safetensors_prefetch_block_size: int = LoadConfig.safetensors_prefetch_block_size
+    # [CN] 权重加载格式：auto/safetensors/pt/binfile/...，也可传自定义插件名。
     load_format: str | LoadFormats = LoadConfig.load_format
+    # [CN] config 的读取格式（auto/hf/mistral 等）。与 load_format 是两件事，别混淆。
     config_format: str = ModelConfig.config_format
+    # [CN] 模型计算 dtype：auto 时按 HF config 的 torch_dtype 推断；
+    #      也可直接指定（含 fp8/fp4 等量化 dtype）。注意它与 quantization 是不同维度。
     dtype: ModelDType = ModelConfig.dtype
+    # [CN] 字段名不对齐：EngineArgs 侧叫 kv_cache_dtype，CacheConfig 侧叫 cache_dtype。
+    #      它只决定 KV cache 的存储精度（auto/fp8/fp8_e5m2/...），不影响计算 dtype。
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    # [CN] 全局随机种子，影响采样与部分随机行为；做可复现压测时需要固定它。
     seed: int = ModelConfig.seed
+    # [CN] 单条请求的最大上下文长度（prompt + output）。None 时取模型 config 的
+    #      max_position_embeddings，随后仍可能被显存上限裁剪（见 _set_default_args）。
     max_model_len: int = ModelConfig.max_model_len
+    # [CN] cudagraph 捕获的 batch size 档位。两者的协作方式：
+    #      显式给出 cudagraph_capture_sizes 时按它来；否则由 max_cudagraph_capture_size
+    #      配合编译配置自动生成一组档位。档位越多显存占用越大，但 padding 浪费越少。
     cudagraph_capture_sizes: list[int] | None = (
         CompilationConfig.cudagraph_capture_sizes
     )
     max_cudagraph_capture_size: int | None = get_field(
         CompilationConfig, "max_cudagraph_capture_size"
     )
+    # [CN] IR 层算子优先级配置（Inductor 选择算子实现时的偏好），属于 KernelConfig。
     ir_op_priority: IrOpPriorityConfig = get_field(KernelConfig, "ir_op_priority")
     # ---------------- 并行与分布式（ParallelConfig / KernelConfig） ----------------
+    #
+    # [CN] vLLM 的并行有五个正交维度，弄清它们的区别是读懂 executor / worker 的前提：
+    #   TP  tensor_parallel_size             —— 层内切分（注意力头、MLP 列切），通信量最大
+    #   PP  pipeline_parallel_size           —— 层间切分，按 stage 流水
+    #   CP  prefill/decode_context_parallel  —— 沿序列长度切分，服务长上下文
+    #   DP  data_parallel_size               —— 整份模型复制多份，各自处理不同请求
+    #   EP  enable_expert_parallel           —— MoE 专家分散到各卡（替代"每卡都放全部专家"）
+    #   world_size = TP * PP * CP * DP，决定了要拉起多少个 worker 进程。
+    #
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
+    # [CN] 执行器后端：uni(单进程) / mp(多进程) / ray / external_launcher，也可传 Executor 子类。
+    #      None 时按 world_size 与环境自动选：单卡用 uni，多卡优先 mp。
     distributed_executor_backend: (
         str | DistributedExecutorBackend | type[Executor] | None
     ) = ParallelConfig.distributed_executor_backend
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    # [CN] master_addr / master_port / nnodes / node_rank 只有在使用 external_launcher
+    #      （slurm、torchrun 等由外部拉起进程的场景）时才需要显式设置；
+    #      uni/mp/ray 后端由 vLLM 自己拉起进程，这四项实际不起作用。
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -604,51 +653,86 @@ class EngineArgs:
     cpu_distributed_timeout_seconds: int | None = (
         ParallelConfig.cpu_distributed_timeout_seconds
     )
+    # [CN] NUMA 绑定：多路 CPU 服务器上把 worker 绑到指定 NUMA 节点/CPU，避免跨片访存。
     numa_bind: bool = ParallelConfig.numa_bind
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
+    # [CN] 限制可见设备。注意这里是硬编码 None（并非取自 ParallelConfig）：
+    #      为 None 表示不过滤，实际可见设备由 CUDA_VISIBLE_DEVICES 等环境变量决定。
     device_ids: list[int | str] | None = None
+    # [CN] TP：把单层权重切开。要求能整除 num_attention_heads、num_key_value_heads
+    #      与 intermediate_size，否则会在模型加载阶段直接报错。
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    # [CN] CP（上下文并行）拆成 prefill / decode 两档，因为两阶段的瓶颈不同，
+    #      允许只对其一开启上下文并行。
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
+    # [CN] DCP（decode context parallel）相关：通信后端、Q 是否各卡复制一份、
+    #      以及 KV cache 的分片交织粒度——交织粒度直接影响负载均衡与访存连续性。
     dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_q_replicate: bool | None = ParallelConfig.dcp_q_replicate
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
+    # [CN] DP：复制多份完整模型，各自独立处理请求。它是提升吞吐最直接的手段，
+    #      并且不会拉低单请求时延（与 TP 相反，TP 降时延但也引入通信开销）。
     data_parallel_size: int = ParallelConfig.data_parallel_size
+    # [CN] 下面几个 None 是"由启动器或运行期推导"的哨兵：
+    #      rank / start_rank / size_local / address / rpc_port 在单节点部署时由 vLLM 自动分配，
+    #      只有跨节点部署、或需要外部负载均衡器接入时才需要手动指定。
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
     data_parallel_size_local: int | None = None
     data_parallel_address: str | None = None
     data_parallel_rpc_port: int | None = None
+    # [CN] 三种负载均衡模式，语义各不相同：
+    #      data_parallel_hybrid_lb             —— 内部混合调度（含 P/D 分离式负载分发）
+    #      data_parallel_external_lb           —— 由外部网关分发，各 DP rank 各自接请求
+    #      data_parallel_multi_port_external_lb —— external_lb 的变体，每个 rank 独占一个端口
     data_parallel_hybrid_lb: bool = False
     data_parallel_external_lb: bool = False
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
+    # [CN] EP（专家并行）：MoE 的专家分散到各张卡，attention 部分仍按 TP/DP 切。
+    #      开启后专家计算依赖 all-to-all 通信，需要 all2all_backend 支持。
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
+    # [CN] 让采样在 batch 维度分片并与 TP 的分片对齐，避免每张卡都重复算全量 logits。
     enable_batch_sharded_sampling: bool | None = (
         ParallelConfig.enable_batch_sharded_sampling
     )
+    # [CN] 加载权重时按 EP 切分过滤掉本卡用不到的专家，显著省显存与加载时间。
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
+    # [CN] 算子后端选择（MoE / linear），属于 KernelConfig，可按硬件挑最优实现。
     moe_backend: MoEBackend = KernelConfig.moe_backend
     linear_backend: LinearBackend = KernelConfig.linear_backend
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
+    # [CN] 弹性 EP：允许运行期动态伸缩专家规模（配合 scale_elastic_ep 接口使用）。
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
+    # [CN] DBO（Dual Batch Overlap）：把一个 batch 拆成两个 micro-batch，
+    #      让一个的计算与另一个的通信重叠，从而把通信"藏"起来。
+    #      ubatch_size 是 micro-batch 大小；两个 threshold 分别是 prefill / decode
+    #      阶段启用 DBO 的最小 token 数——低于阈值时拆批的开销大于收益，反而更慢。
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
+    # [CN] DP 各 rank 之间同步权重/状态的间隔（按 step 计）。
     dp_sync_interval: int = ParallelConfig.dp_sync_interval
     dbo_prefill_token_threshold: int = ParallelConfig.dbo_prefill_token_threshold
+    # [CN] 不用 NCCL 而改用更轻的方式做 DP 同步（某些环境 NCCL 初始化极慢或不可用）。
     disable_nccl_for_dp_synchronization: bool | None = (
         ParallelConfig.disable_nccl_for_dp_synchronization
     )
+    # [CN] EPLB（Expert Parallel Load Balancing）：MoE 各专家负载不均衡时做重排/冗余复制。
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
+    # [CN] 专家放置策略：如何在各卡之间分配专家，直接影响 all-to-all 流量与均衡度。
     expert_placement_strategy: ExpertPlacementStrategy = (
         ParallelConfig.expert_placement_strategy
     )
+    # [CN] 带下划线前缀 = 内部字段，由 API server 进程启动 DP 时自动填入，
+    #      用户不应手动设置，也不保证跨版本稳定。
     _api_process_count: int = ParallelConfig._api_process_count
     _api_process_rank: int = ParallelConfig._api_process_rank
+    # [CN] 并行加载权重的 worker 数；None 时按模型规模与可用显存自动决定。
     max_parallel_loading_workers: int | None = (
         ParallelConfig.max_parallel_loading_workers
     )
@@ -672,28 +756,62 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    # [CN] 显存预算有【两种互斥的指定方式】，理解区别很重要：
+    #   gpu_memory_utilization —— 按比例（占整卡显存的比例），传统方式；
+    #   kv_cache_memory_bytes  —— 按绝对字节数，直接指定 KV cache 可用容量。
+    #   二者只能设其一，装配期校验。后者更精确：比例方式在"多进程共享同一张卡"
+    #   或"卡上已有其他进程占用显存"时容易算出错误结果。
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    # [CN] 这组"并发上限"是全项目最容易混淆的一组参数，务必分清：
+    #   max_num_batched_tokens   —— 单个 step 内参与 forward 的 token 总数上限。
+    #                               chunked prefill 下它决定 prefill 被切成多大的块。
+    #   max_num_scheduled_tokens —— 单条请求在单个 step 内最多被调度多少 token，
+    #                               防止一条超长请求独占整个 step。
+    #   max_num_seqs             —— 单个 step 内并发的序列条数上限（batch 的"行数"）。
+    #   三者共同决定 scheduler 每步能塞多少活：调大提升吞吐，但也抬高显存与时延。
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
+    # [CN] chunked prefill 下，"prompt 长度超过该值"的请求被视作长 prefill，
+    #      会额外施加调度上限（0 表示关闭该判定）。
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: int | None = None
+    # [CN] 准入控制（背压）：在途（waiting 或 running）请求数 / 提示 token 总数的上限。
+    #      超限后新请求直接被拒（HTTP 503 让客户端重试别处），而不是无限排队——
+    #      这是给 vLLM 原本无界请求队列加的一道粗粒度容量阀门。
+    #      注意与 max_num_seqs 的区别：后者是"每 DP rank 每 step 的并发数"，
+    #      而 max_num_queued_reqs 在 API server 进程里统计、跨所有 DP rank 生效，
+    #      建议按 data_parallel_size * max_num_seqs + 期望排队深度 来设置。
     max_num_queued_reqs: int | None = None
     max_num_queued_tokens: int | None = None
+    # [CN] 单次请求可返回的 logprobs 数量上限。这是安全阈值：
+    #      不加限制时 n × vocab 的返回量会轻易打爆内存与带宽。
     max_logprobs: int = ModelConfig.max_logprobs
+    # [CN] logprobs 的口径（是否包含温度、penalty 等变换前的值）。
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
+    # [CN] 用 float64 计算 gumbel（无放回采样等场景需要），精度更高但更慢。
     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
+    # [CN] trace 回放模式：按记录的请求时间线重放，用于可复现的压测。
     enable_trace_replay: bool = ModelConfig.enable_trace_replay
     disable_log_stats: bool = False
+    # [CN] DP 多 rank 时，把各 rank 的统计日志聚合后统一输出（否则同一条日志刷 N 遍）。
     aggregate_engine_logging: bool = False
+    # [CN] revision / code_revision / tokenizer_revision：HF 仓库的分支、tag 或 commit。
+    #      三者可分别指定权重、自定义建模代码、tokenizer 的来源；生产环境建议钉死版本。
     revision: str | None = ModelConfig.revision
     code_revision: str | None = ModelConfig.code_revision
+    # [CN] HF 访问令牌。bool 形式是语义开关：True=使用环境变量中的 token，False=不使用。
     hf_token: bool | str | None = ModelConfig.hf_token
+    # [CN] 直接覆盖 HF config 中的字段（如 max_position_embeddings、num_hidden_layers），
+    #      用于不改权重文件就调整结构。注意：覆盖后若与真实权重不匹配会直接加载失败。
     hf_overrides: HfOverrides = get_field(ModelConfig, "hf_overrides")
+    # [CN] {模型架构名: 自定义实现类路径}——不改动注册表就能替换某个架构的实现。
     model_class_overrides: dict[str, str] = get_field(
         ModelConfig, "model_class_overrides"
     )
     tokenizer_revision: str | None = ModelConfig.tokenizer_revision
+    # [CN] quantization 是简写名（"fp8"/"awq"/"gptq" ...）或自定义量化插件名；
+    #      若需要更细粒度的控制，则改用下面的 quantization_config。
     quantization: QuantizationMethods | str | None = ModelConfig.quantization
     quantization_config: "dict[str, Any] | QuantizationConfigArgs | None" = None
     """User-facing quantization configuration. Carries per-layer-kind
@@ -705,7 +823,10 @@ class EngineArgs:
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     # ---------------- 多模态（MultiModalConfig） ----------------
+    # [CN] 只跑语言模型部分（跳过视觉塔等多模态编码器），用于调试或复用已算好的 embedding。
     language_model_only: bool = MultiModalConfig.language_model_only
+    # [CN] 注意改名：EngineArgs 侧叫 limit_mm_per_prompt，MultiModalConfig 侧叫 limit_per_prompt。
+    #      形如 {"image": 2, "video": {"num_frames": 32}}——值可以是数量上限，也可以带子维度限制。
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
         MultiModalConfig, "limit_per_prompt"
     )
@@ -714,7 +835,11 @@ class EngineArgs:
     media_io_kwargs: dict[str, dict[str, Any]] = get_field(
         MultiModalConfig, "media_io_kwargs"
     )
+    # [CN] 透传给 HF processor 的额外 kwargs（如图像分辨率策略）。
+    #      注意它参与多模态 hash 计算：改动它会使已缓存的预处理结果全部失效。
     mm_processor_kwargs: dict[str, Any] | None = MultiModalConfig.mm_processor_kwargs
+    # [CN] 多模态预处理结果（图像/视频张量）的缓存，按 hash 复用以避免重复编解码。
+    #      type 可选 "shm"（共享内存，可跨进程复用）或 "lru"（仅进程内）。
     mm_processor_cache_gb: float = MultiModalConfig.mm_processor_cache_gb
     mm_processor_cache_type: MMCacheType | None = (
         MultiModalConfig.mm_processor_cache_type
@@ -725,8 +850,13 @@ class EngineArgs:
     mm_shm_cache_max_object_size_mb: int = (
         MultiModalConfig.mm_shm_cache_max_object_size_mb
     )
+    # [CN] 只跑多模态编码器（输出 embedding 供外部复用），与 language_model_only 正好相对。
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
+    # [CN] 编码器是否参与 TP（"replicated" / "sharded"）。视觉塔通常远小于 LLM，
+    #      复制一份比切分更划算（省掉 all-gather 通信），这就是默认策略的由来。
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    # [CN] 编码器（如 ViT）可用独立的 attention backend 与 dtype，
+    #      因为它的算子特征与 LLM decode 完全不同（短 batch 长序列 vs 长 batch 短序列）。
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -738,7 +868,10 @@ class EngineArgs:
     mm_encoder_fp8_scale_save_margin: float = (
         MultiModalConfig.mm_encoder_fp8_scale_save_margin
     )
+    # [CN] 自定义 IO 处理器插件（接管输入预处理 / 输出后处理），None 表示用内置实现。
     io_processor_plugin: str | None = None
+    # [CN] 渲染（chat template 展开）使用的 worker 数。硬编码默认 1：
+    #      多 worker 需要额外的进程池开销，只有在渲染成为瓶颈时才值得开大。
     renderer_num_workers: int = 1
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
@@ -751,10 +884,16 @@ class EngineArgs:
     # LoRAConfig 是"可选子配置"：enable_lora=False 时 create_engine_config 会直接
     # 返回 None，下面这些字段即使被设置也不会生效。
     enable_lora: bool = False
+    # [CN] 同时活跃的 LoRA 数量上限；超出的请求需排队等待，它直接决定 LoRA 的显存占用。
     max_loras: int = LoRAConfig.max_loras
+    # [CN] 支持的 rank 档位——只能是枚举里的那几个值，不能任意填写，
+    #      因为 punica 等 kernel 需要按固定 rank 预先分配 buffer / 选择实现。
     max_lora_rank: MaxLoRARanks = LoRAConfig.max_lora_rank
     default_mm_loras: dict[str, str] | None = LoRAConfig.default_mm_loras
+    # [CN] LoRA 权重也按 TP 分片（省显存），代价是每次用之前要多一次 all-gather。
     fully_sharded_loras: bool = LoRAConfig.fully_sharded_loras
+    # [CN] CPU 侧常驻的 LoRA 数量，为 None 时等于 max_loras——
+    #      即"热 LoRA 全留在 CPU 内存、按需换入显存"，用内存换显存。
     max_cpu_loras: int | None = LoRAConfig.max_cpu_loras
     lora_dtype: str | torch.dtype | None = LoRAConfig.lora_dtype
     lora_target_modules: list[str] | None = LoRAConfig.target_modules
@@ -764,18 +903,34 @@ class EngineArgs:
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
+    # [CN] 手动指定 KV cache 块数，跳过启动时的显存 profiling 自动探测。
+    #      用于多实例共享同一张卡、或 profiling 结果不稳定的场景；
+    #      设错会直接 OOM（设大）或浪费显存（设小）。
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
+    # [CN] 透传给具体 model loader 的额外配置（如 runai 流式加载的参数）。
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
+    # [CN] 加载权重时跳过的文件名模式（如 "*.pt"、"original/*"），能显著加快加载速度。
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
     # ---------------- 调度（SchedulerConfig） ----------------
     # 同样是"未指定"哨兵，依赖模型能力与硬件在 _set_default_*_args 中推导
+    # [CN] chunked prefill：把长 prompt 切成小块，与 decode 混在同一个 step 里跑，
+    #      避免一条长 prefill 独占 GPU 导致其余请求卡顿——这是 vLLM 高吞吐的关键机制之一。
+    #      None 表示"用户未指定"，装配期由模型能力与硬件自动决定（通常是开）。
     enable_chunked_prefill: bool | None = None
+    # [CN] 关闭多模态输入的切分：多模态 prefill 切分需要额外处理视觉 token 的边界。
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
+    # [CN] 准入新请求时，检查的是"整条输入序列能否装进 KV cache"，而不是"第一个 chunk 能否装下"。
+    #      这样能防止 chunked prefill 下的过度准入（over-admission）与 KV cache 反复颠簸。
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
+    # [CN] 仅在 data-parallel 部署下有意义：每 N 个 engine step 才准入一批新的 prefill
+    #      请求，且各 DP rank 步调对齐，从而让每步 forward 的耗时更均衡（默认 1=每步都准入）。
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
 
+    # [CN] 水位线：预留"总块数 × watermark"的空闲块作为余量。它只在把
+    #      waiting / preempted 状态的请求准入 running 队列时生效（且已有请求被调度的前提下），
+    #      用来减少显存吃紧时的频繁驱逐与反复抢占。取值 [0.0, 1.0)，0.0 表示关闭。
     watermark: float = SchedulerConfig.watermark
 
     disable_hybrid_kv_cache_manager: bool | None = (
@@ -788,16 +943,27 @@ class EngineArgs:
     reasoning_parser: str = StructuredOutputsConfig.reasoning_parser
     reasoning_parser_plugin: str | None = None
 
+    # [CN] 投机解码有两种写法：
+    #   老写法：speculative_config 直接给一整块 JSON（如 {"method":"eagle","model":...}）
+    #   新写法：spec_method / spec_model / spec_tokens 三个扁平参数（CLI 上更好敲）
+    #   二者最终都会被归一化成 SpeculativeConfig；同时给出时以扁平参数为准并会告警。
     speculative_config: dict[str, Any] | None = None
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
+    # [CN] 扩散模型（runner="diffusion"）的配置，与 LLM 生成链路相互独立。
     diffusion_config: dict[str, Any] | None = None
 
+    # ---------------- 可观测性（ObservabilityConfig） ----------------
+    # [CN] 这些开关默认大多关闭，因为它们会带来可测量的运行时开销。
+    # [CN] 兼容开关：让指标输出保持某个旧版本的行为（升级后监控不炸）。
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
     )
+    # [CN] OTLP trace 上报地址（如 http://jaeger:4318/v1/traces）。设为 None 则不上报。
     otlp_traces_endpoint: str | None = ObservabilityConfig.otlp_traces_endpoint
+    # [CN] 指定要为哪些模块采集细粒度 trace（如 model、worker、sampler）。
+    #      粒度越细开销越大，只应在定位问题时临时开启。
     collect_detailed_traces: list[DetailedTraceModules] | None = (
         ObservabilityConfig.collect_detailed_traces
     )
@@ -819,48 +985,79 @@ class EngineArgs:
     jit_monitor_mode: Literal["warn", "error"] = ObservabilityConfig.jit_monitor_mode
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
+    # [CN] 调度策略（fcfs / priority 等）。注意字段名改名：
+    #      EngineArgs 侧叫 scheduling_policy，SchedulerConfig 侧叫 policy。
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    # [CN] 自定义 scheduler 类（可传类本身或 "mod.cls" 字符串路径），
+    #      替换默认的 vllm.v1.core.sched.scheduler.Scheduler。
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
+    # [CN] pooling 模型（embedding / 分类）的输出汇聚方式配置。
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
+    # ---------------- 编译 / 内核 / 注意力（整块子配置直接提升） ----------------
+    # [CN] 下面几个是"整块子配置"而非扁平字段：用 get_field(VllmConfig, ...) 取到
+    #      VllmConfig 里该子配置的默认实例。因为它们是 dataclass，
+    #      _compute_kwargs 会用 TypeAdapter.validate_json 解析，CLI 上直接传一整块 JSON。
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
+    # [CN] 让 flashinfer 在启动时做 autotune（挑最优 kernel 配置），会拉长启动时间。
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
     )
+    # [CN] None = 未指定（由 kernel 后端按硬件决定），True/False = 强制开关。
     enable_bf16x3_router_gemm: bool | None = None
+    # [CN] 替换 worker 实现类 / 给 worker 挂扩展类，是平台适配（非 GPU 后端）的挂载点。
     worker_cls: str = ParallelConfig.worker_cls
     worker_extension_cls: str = ParallelConfig.worker_extension_cls
 
     profiler_config: ProfilerConfig = get_field(VllmConfig, "profiler_config")
 
+    # ---------------- KV / 编码器缓存的跨实例传输（P/D 分离、prefix 共享） ----------------
+    # [CN] kv_transfer_config 为 None 表示不做 KV 传输（单机常规部署就是这个）。
+    #      非空时启用 connector（如 NixlConnector / LMCache），支持 prefill-decode 分离。
     kv_transfer_config: KVTransferConfig | None = None
+    # [CN] KV 事件发布（block 被换入/换出等）的配置，供外部缓存系统订阅。
     kv_events_config: KVEventsConfig | None = None
 
+    # [CN] EC = Encoder Cache（多模态编码器输出缓存），与 KV cache 是两套独立缓存。
     ec_transfer_config: ECTransferConfig | None = None
     ec_manager_config: EncoderCacheManagerConfig = get_field(
         VllmConfig, "ec_manager_config"
     )
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
 
+    # [CN] 从模型的 generation_config.json 读取默认采样参数（temperature 等）。
+    #      设为 "vllm" 时读 vLLM 自己的默认；设为 "auto" 时读 HF 的。
     generation_config: str = ModelConfig.generation_config
+    # [CN] 睡眠模式：让引擎释放显存（权重/KV）后"休眠"，被唤醒时再恢复。
+    #      用于 RLHF 等需要"训练与推理交替占用同一张卡"的场景，避免反复启停进程。
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
+    # [CN] 用 CUDA VMM（虚拟内存管理）分配器做显存的按需映射/释放，配合 sleep 模式。
     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
+    # [CN] 休眠时挂起 NCCL 通信域而不是销毁它，唤醒时可复用（省去重建通信域的开销）。
     enable_nccl_comm_suspend: bool = ModelConfig.enable_nccl_comm_suspend
+    # [CN] 覆盖模型自带的 generation_config 中的字段（优先级最高）。
     override_generation_config: dict[str, Any] = get_field(
         ModelConfig, "override_generation_config"
     )
+    # [CN] 选用哪种模型实现（如 "vllm" / "transformers" / "auto"）。
     model_impl: str = ModelConfig.model_impl
+    # [CN] 指定 attention 后端（FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENSION ...）。
+    #      None 时会由 AttentionSelector 按硬件、dtype、head size 等自动挑选。
     attention_backend: AttentionBackendEnum | None = AttentionConfig.backend
 
+    # ---------------- Mamba / 混合模型（状态空间模型）的缓存 ----------------
+    # [CN] Mamba 类模型没有 KV cache，而是 SSM state cache，因此有一整套独立参数。
+    # [CN] 按层名指定"这些层不参与 kv_cache_dtype 量化"，用于敏感层保精度。
     kv_cache_dtype_skip_layers: list[str] = get_field(
         CacheConfig, "kv_cache_dtype_skip_layers"
     )
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
+    # [CN] 前缀匹配的粒度单位：Mamba 的 state 不能逐 token 复用，需要按块对齐。
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
@@ -882,20 +1079,30 @@ class EngineArgs:
         ModelConfig.logits_processors
     )
     """Custom logitproc types"""
+    # [CN] 自定义 logits processor 的插件入口：可在采样前对 logits 做任意变换
+    #      （如禁用某些 token、加自定义 bias）。传类名或 "mod.cls" 字符串。
 
+    # [CN] 异步调度：让 CPU 侧的调度准备与 GPU 上的 forward 重叠，降低 CPU 成为瓶颈的概率。
+    #      None 时按配置自动决定；某些模型/后端不支持，会被强制关掉。
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
+    # [CN] 流式输出的间隔（每生成多少个 token 推一次）。调大降开销、调小更"实时"。
     stream_interval: int = SchedulerConfig.stream_interval
 
+    # [CN] 开启"KV 共享快速 prefill"：多个请求共享同一段 KV 时走加速路径。
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
+    # [CN] 优化等级与性能模式是 VllmConfig 级别的"总开关"，
+    #      会批量改写 CompilationConfig 中的融合/编译策略（见 config/vllm.py 的 OPTIMIZATION_LEVEL_*）。
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 
+    # [CN] 容错：某个 worker 挂掉时尝试恢复/重启，而不是整个引擎退出。
     fault_tolerance_config: FaultToleranceConfig = get_field(
         ParallelConfig, "fault_tolerance_config"
     )
     enable_fault_tolerance: bool = ParallelConfig.enable_fault_tolerance
 
+    # [CN] 把一部分 KV cache 卸载到 CPU/其他设备的容量（GB 或比例，视实现而定）。
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     tokens_only: bool = False
@@ -1001,6 +1208,23 @@ class EngineArgs:
         # 中文补充：把 EngineArgs 的字段注册到 argparse 上。每个子配置对应一个
         # argument_group，参数名统一为 --连字符形式，而 kwargs（默认值、help、
         # type/choices）由 get_kwargs(子配置类) 反射得到。
+        #
+        # [CN] 【本函数的整体形态】下面 900 多行几乎是同一套模板的重复：
+        #         <group>_kwargs = get_kwargs(SomeConfig)      # 反射出 {字段: argparse kwargs}
+        #         <group>_group  = parser.add_argument_group(title="SomeConfig", ...)
+        #         <group>_group.add_argument("--some-field", **<group>_kwargs["some_field"])
+        #       所以读它时不必逐行看，只需理解三件事：
+        #       1) 参数名 = 字段名把下划线换成连字符；
+        #       2) 每个参数的 type/choices/nargs/default 全部来自字段的类型注解与默认值，
+        #          即"配置类改一处，CLI 自动跟着变"；
+        #       3) 少数地方会**手工覆盖** kwargs（改 default、追加 help、删掉 choices），
+        #          这些才是需要特别留意的例外，都会在下面就近标注。
+        #
+        # [CN] 为什么 CLI 参数没有覆盖 EngineArgs 的全部字段？
+        #       因为有些字段不适合/不需要在命令行上暴露（内部结构、内部推导值、
+        #       或只在 Python API 里才有意义的字段），它们只能在 EngineArgs(...) 里传。
+        #       反过来，有些 CLI 参数是本函数额外加的（不属于任何子配置字段），
+        #       会在 from_cli_args 之后由调用方单独处理。
 
         # Model arguments
         # 例外：`vllm serve --help` 时不注册 --model，避免与 serve 子命令自己的
@@ -1137,6 +1361,8 @@ class EngineArgs:
         )
 
         # Attention arguments
+        # [CN] AttentionConfig 只暴露一个 backend：其余注意力相关参数（如 KV cache 布局）
+        # 要么自动推导、要么属于其它子配置。
         attention_kwargs = get_kwargs(AttentionConfig)
         attention_group = parser.add_argument_group(
             title="AttentionConfig",
@@ -1147,6 +1373,10 @@ class EngineArgs:
         )
 
         # Mamba arguments
+        # [CN] Mamba（状态空间模型）专属配置。注意字段改名：
+        #      MambaConfig 里是 ssu_algorithm / enable_stochastic_rounding /
+        #      stochastic_rounding_philox_rounds，CLI 上都加了 mamba 前缀。
+        #      随机舍入（stochastic rounding）用于低精度 state 累积时保持无偏。
         mamba_kwargs = get_kwargs(MambaConfig)
         mamba_group = parser.add_argument_group(
             title="MambaConfig",
@@ -1166,6 +1396,9 @@ class EngineArgs:
         )
 
         # Structured outputs arguments
+        # [CN] 结构化输出（JSON schema / grammar）与 reasoning parser。
+        #      注意 --reasoning-parser 的 choices 会被留到解析之后再校验，
+        #      因为插件可能额外注册新的 parser，反射阶段拿不到完整列表。
         structured_outputs_kwargs = get_kwargs(StructuredOutputsConfig)
         structured_outputs_group = parser.add_argument_group(
             title="StructuredOutputsConfig",
@@ -1262,6 +1495,11 @@ class EngineArgs:
         parallel_group.add_argument(
             "--data-parallel-size", "-dp", **parallel_kwargs["data_parallel_size"]
         )
+        # [CN] 下面这几个 DP 参数是【手工注册】的（手写 type + help，不用反射），
+        #      因为它们在 ParallelConfig 上的默认语义与 CLI 侧不同（CLI 侧默认 None
+        #      = "未指定，稍后推导"，而配置侧需要一个确定值）。
+        #      另一个共同点：它们都带一个短选项（-dpn/-dpr/-dpl/-dpa/-dpp/-dpb/-dph/-dpe/-dpm），
+        #      便于在多节点脚本里书写。注意 -dp 系列短选项极易记混，建议脚本里写全称。
         parallel_group.add_argument(
             "--data-parallel-rank",
             "-dpn",
@@ -1604,6 +1842,9 @@ class EngineArgs:
         )
 
         # LoRA related configs
+        # [CN] 注意 --enable-lora 是【手工注册】的，不走反射：因为 EngineArgs 上的
+        #      enable_lora 是硬编码 False，而 LoRAConfig 里并没有这个字段。
+        #      它是 LoRA 的总开关：为 False 时下面这些 LoRA 参数全部不生效。
         lora_kwargs = get_kwargs(LoRAConfig)
         lora_group = parser.add_argument_group(
             title="LoRAConfig",
@@ -1645,6 +1886,8 @@ class EngineArgs:
         )
 
         # Observability arguments
+        # [CN] 这一组几乎全部默认关闭——trace / 细粒度指标都会带来可观测的运行时开销，
+        #      只应在定位问题时临时打开。
         observability_kwargs = get_kwargs(ObservabilityConfig)
         observability_group = parser.add_argument_group(
             title="ObservabilityConfig",
@@ -2411,11 +2654,15 @@ class EngineArgs:
                     f"`--node-rank {self.node_rank}`. Set it to this node's "
                     "zero-based index."
                 )
+            # [CN] 每个节点分到的进程数；本节点的第一个 DP rank =
+            #      (本节点起始进程号) / (单个 DP rank 占多少进程)，
+            #      即"节点内第 node_rank 段、每段 local_world_size 个进程"对应的 DP 编号。
             local_world_size = world_size // self.nnodes
             inferred_data_parallel_rank = (
                 self.node_rank * local_world_size
             ) // world_size_within_dp
             if self.data_parallel_size > 1 and self.data_parallel_external_lb:
+                # [CN] external LB 下每个 rank 必须有确定身份，因此直接采用推断值。
                 self.data_parallel_rank = inferred_data_parallel_rank
                 logger.info(
                     "Inferred data_parallel_rank %d from node_rank %d for external lb",
@@ -2424,9 +2671,13 @@ class EngineArgs:
                 )
             elif self.data_parallel_size_local is None:
                 # Infer data parallel size local for internal dplb:
+                # [CN] internal LB 下只需知道"本节点有几个 DP rank"，
+                #      = 本节点进程数 / 每个 DP rank 的进程数，至少为 1。
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+        # [CN] 关键推导：只要用户显式给了 --data-parallel-rank，就等价于开启 external LB
+        #      （因为指定了 rank 意味着外部已经知道要往哪个实例发请求）。
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
@@ -2448,6 +2699,8 @@ class EngineArgs:
                 "instances without --data-parallel-* arguments."
             )
         # Local DP rank = 1, use pure-external LB.
+        # [CN] external LB 分支：每个实例独占一个 rank（local size 强制为 1），
+        #      且必须能确定 rank；同时它天然不是 hybrid（hybrid 要求节点内有多个 rank）。
         if data_parallel_external_lb:
             if self.data_parallel_rank is None:
                 raise ValueError(
@@ -2468,14 +2721,19 @@ class EngineArgs:
             # Use full external lb if we have local_size of 1.
             self.data_parallel_hybrid_lb = False
         elif self.data_parallel_size_local is not None:
+            # [CN] 用户显式给了 --data-parallel-size-local（本节点的 rank 数）。
             data_parallel_size_local = self.data_parallel_size_local
 
             if self.data_parallel_start_rank is not None and not headless:
                 # Infer hybrid LB mode.
+                # [CN] 显式给了起始 rank 说明用户自己在编排 rank 分布 —— 判定为 hybrid LB。
+                #      headless 模式（只跑 engine 不跑 API server）下不做此推断。
                 self.data_parallel_hybrid_lb = True
 
             if self.data_parallel_hybrid_lb and data_parallel_size_local == 1:
                 # Use full external lb if we have local_size of 1.
+                # [CN] hybrid 的前提是"节点内有多个 rank 需要内部再分发"；
+                #      若节点内只有 1 个 rank，hybrid 就退化成了 external，自动降级。
                 logger.warning(
                     "data_parallel_hybrid_lb is not eligible when "
                     "data_parallel_size_local = 1, autoswitch to "
@@ -2486,8 +2744,10 @@ class EngineArgs:
 
             if data_parallel_size_local == self.data_parallel_size:
                 # Disable hybrid LB mode if set for a single node
+                # [CN] 本地规模 == 全局规模，说明实际只有一个节点，hybrid 无意义。
                 self.data_parallel_hybrid_lb = False
 
+            # [CN] 优先用用户给的 start_rank，否则用前面按 node_rank 推断出的值。
             self.data_parallel_rank = (
                 self.data_parallel_start_rank
                 if self.data_parallel_start_rank is not None
@@ -2500,6 +2760,7 @@ class EngineArgs:
                     self.node_rank,
                 )
         else:
+            # [CN] 既非 external、又没指定 local size 的兜底分支（最常见的单节点场景）。
             if self.data_parallel_hybrid_lb:
                 raise ValueError(
                     "Invalid data-parallel launch options: "
@@ -2513,13 +2774,18 @@ class EngineArgs:
             ):
                 # Data parallel size defaults to 1 if DP ranks are spanning
                 # multiple nodes
+                # [CN] "span" 策略下 DP rank 会被打散到多个节点，
+                #      本节点内可能不足一个完整 DP rank，故本地规模记为 1。
                 data_parallel_size_local = 1
             else:
                 # Otherwise local DP size defaults to global DP size if not set
+                # [CN] 单节点默认：本地规模 = 全局 DP 规模。
                 data_parallel_size_local = self.data_parallel_size
 
         # DP address, used in multi-node case for torch distributed group
         # and ZMQ sockets.
+        # [CN] DP 主地址用于建立 torch 分布式通信组与 ZMQ socket。
+        #      ray 后端用本机 IP（ray 自己管理节点发现）；mp 后端退回 master_addr 或默认值。
         if self.data_parallel_address is None:
             if self.data_parallel_backend == "ray":
                 host_ip = get_ip()
@@ -2540,16 +2806,23 @@ class EngineArgs:
 
         # This port is only used when there are remote data parallel engines,
         # otherwise the local IPC transport is used.
+        # [CN] 只有存在"远端" DP engine（跨节点/跨进程）时才需要 TCP 端口；
+        #      同机同进程组直接用 IPC，不占端口。
         data_parallel_rpc_port = (
             self.data_parallel_rpc_port
             if (self.data_parallel_rpc_port is not None)
             else ParallelConfig.data_parallel_rpc_port
         )
 
+        # [CN] tokens_only 模式：输入已是 token id，强制跳过 tokenizer 初始化。
+        #      注意这里是【就地修改已构造好的 model_config】——因为 skip_tokenizer_init
+        #      要影响后续 layout，来不及回到 create_model_config 里改。
         if self.tokens_only and not model_config.skip_tokenizer_init:
             model_config.skip_tokenizer_init = True
             logger.info("Skipping tokenizer initialization for tokens-only mode.")
 
+        # [CN] ParallelConfig 依赖 ModelConfig（is_moe、以及下面要用到 model_config 的
+        #      若干字段）与上面推导好的 DP 拓扑，因此必须排在两者之后构造。
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
@@ -2618,6 +2891,10 @@ class EngineArgs:
             parallel_config,
         )
 
+        # [CN] 这四个断言是"哨兵已消除"的契约检查：前面三个字段初始为 None，
+        #      必须由 _set_default_* 系列方法填入真实值；max_model_len 则应由
+        #      ModelConfig 解析完成。它们不是给用户的入参校验，而是防止
+        #      后续新增代码路径时漏掉默认值推导步骤的内部一致性保护。
         assert self.max_num_batched_tokens is not None, (
             "max_num_batched_tokens must be set by this point"
         )
@@ -2737,6 +3014,11 @@ class EngineArgs:
             attention_config.flash_attn_version = 2
 
         # Mamba config overrides
+        # [CN] 下面三组（mamba / kernel / compilation）用的是同一个模式：
+        #      先 deepcopy 出一份顶层子配置的副本，再把 EngineArgs 上那些"被提升过的
+        #      扁平字段"逐个覆盖回去。之所以要 deepcopy：self.mamba_config 可能来自
+        #      默认值（各调用方共享的同一实例），直接改会污染其他实例。
+        #      覆盖时统一遵守"只有非 None / 非 auto 才覆盖"，以便区分"显式设置"与"未指定"。
         mamba_config = copy.deepcopy(self.mamba_config)
         # Convert string to enum if needed (CLI parsing returns a string)
         if isinstance(self.mamba_backend, str):
@@ -2756,6 +3038,9 @@ class EngineArgs:
         mamba_config.validate_ssu_algorithm()
 
         # Kernel config overrides
+        # [CN] 互斥性校验的意义：enable_flashinfer_autotune 同时存在于
+        #      EngineArgs（扁平字段）和 KernelConfig（嵌套字段）两侧，
+        #      两边都设了就无法判断以谁为准，因此直接报错而不是"后者覆盖前者"。
         kernel_config = copy.deepcopy(self.kernel_config)
         if self.enable_flashinfer_autotune is not None:
             if kernel_config.enable_flashinfer_autotune is not None:
@@ -2791,6 +3076,9 @@ class EngineArgs:
         load_config = self.create_load_config()
 
         # Pass reasoning_parser into StructuredOutputsConfig
+        # [CN] 同样是"扁平字段回填嵌套配置"：reasoning_parser / reasoning_parser_plugin
+        #      在 EngineArgs 上是顶层字段，但语义上属于 StructuredOutputsConfig。
+        #      注意这里改的是 self.structured_outputs_config 本身（就地修改）。
         if self.reasoning_parser:
             self.structured_outputs_config.reasoning_parser = self.reasoning_parser
 
@@ -2820,6 +3108,8 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
+        # [CN] 三种卸载策略在此合体：OffloadConfig 是外壳，内部挂 UVA（统一虚拟寻址，
+        #      把权重映射到 CPU 内存按需换页）与 Prefetch（按组分批预取）两套具体策略。
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
             uva=UVAOffloadConfig(

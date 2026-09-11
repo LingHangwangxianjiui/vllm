@@ -32,6 +32,10 @@ else:
     Request = object
 
 
+# [CN] **首次**被调度的请求。worker 进程会把这些数据**缓存**起来，
+#      之后每一步只发增量（见下面的 CachedRequestData）。
+#      这是 vLLM 调度开销能压得这么低的关键：
+#      prompt token ids 只传一次，而不是每步重传。
 @dataclass
 class NewRequestData:
     req_id: str
@@ -39,6 +43,8 @@ class NewRequestData:
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
+    # [CN] 每个 KV cache group 一份 block id 列表，所以是 tuple[list[int], ...]。
+    #      混合模型（full + sliding + mamba）会有多个 group。
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
@@ -48,6 +54,8 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # [CN] 从 Request 构造。注意 mm_features 会被 strip_covered_mm_data 裁剪 ——
+    #      已经算过的多模态部分不再重复发送。
     @classmethod
     def from_request(
         cls,
@@ -76,6 +84,7 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
         )
 
+    # [CN] prompt 长度：token ids 与 prompt_embeds 二选一（后者取 shape[0]）。
     @property
     def prompt_len(self) -> int:
         if self.prompt_token_ids is not None:
@@ -103,6 +112,8 @@ class NewRequestData:
         )
 
     # Version of __repr__ with the prompt data obfuscated
+    # [CN] 脱敏版 repr：只打印长度不打印内容。
+    #      为什么需要：prompt 里可能有用户隐私数据，日志里不能全打出来。
     def anon_repr(self) -> str:
         prompt_token_ids_len = (
             len(self.prompt_token_ids) if self.prompt_token_ids is not None else None
@@ -128,16 +139,28 @@ class NewRequestData:
         )
 
 
+# [CN] **已经调度过**的请求，本轮只发**增量**。
+#      这里的每个字段都是 list，按 req_ids 的下标**对齐**（SoA 布局），
+#      而不是 list[dict]（AoS）。原因：跨进程序列化时 SoA 更紧凑。
 @dataclass
 class CachedRequestData:
     req_ids: list[str]
+    # [CN] 这两类请求的区别很关键：
+    #        - 不在 resumed_req_ids 里：new_block_ids **追加**到已有 block 列表
+    #          （正常解码，新分配块）；
+    #        - 在 resumed_req_ids 里：new_block_ids **替换**整个 block 列表
+    #          （请求被抢占后重新调度，block 已经全换了）。
     # For request ids not in resumed_req_ids, new_block_ids will be appended to
     # the request's block IDs. For those in the set, new_block_ids will be used as the
     # request's block IDs instead of appending to the existing block IDs.
     resumed_req_ids: set[str]
+    # [CN] 只有流水线并行（PP）时才需要传新 token —— 因为后面的 stage
+    #      需要拿到 token 才能继续。非 PP 时这个字段是空的。
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
+    # [CN] 上一轮**没被调度**的请求也要把 token ids 传给 KV connector，
+    #      否则 PD 分离场景下它们的 KV 会漏传。
     # MRV1-only: For requests not scheduled in the last step, propagate the token ids
     # to the connector. Won't contain requests scheduled in the prior step.
     all_token_ids: dict[str, list[int]]
@@ -170,6 +193,8 @@ class CachedRequestData:
     def num_reqs(self) -> int:
         return len(self.req_ids)
 
+    # [CN] 用 cached_property 做 O(1) 查表。之所以安全，是因为
+    #      CachedRequestData **每轮新建**，且在本轮内不会被修改。
     @cached_property
     def _req_id_to_num_output_tokens(self) -> dict[str, int]:
         """Cache mapping of req_id to num_output_tokens for O(1) lookup.
@@ -180,10 +205,13 @@ class CachedRequestData:
         """
         return dict(zip(self.req_ids, self.num_output_tokens))
 
+    # [CN] 判断是否处于 context（prefill）阶段：已输出 token 数为 0。
+    #      用于统计 TTFT 与区分 prefill / decode。
     def is_context_phase(self, req_id: str) -> bool:
         num_output_tokens = self._req_id_to_num_output_tokens.get(req_id)
         return num_output_tokens is not None and num_output_tokens == 0
 
+    # [CN] 空输出的哨兵：没有请求被调度时返回这个，避免到处判 None。
     @classmethod
     def make_empty(cls) -> "CachedRequestData":
         return cls(
@@ -205,6 +233,9 @@ class ScheduledEncoderInputStats:
     output_tokens: int = 0
 
 
+# [CN] 给 **producer 侧 KV connector** 看的调度器本地快照。
+#      注意最后一行的说明：它到 worker 之前会被置 None，
+#      也就是说它是**调度器内部**用的，不参与跨进程传输。
 @dataclass
 class KVConnectorBlockState:
     """Scheduler-local block state offered to a producer-side KV connector."""
@@ -215,63 +246,99 @@ class KVConnectorBlockState:
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
 
 
+# [CN] **调度器的输出 = 引擎与 worker 之间最重要的一份契约**。
+#      读懂这个文件，就等于读懂了"调度决策如何传达给模型执行层"。
+#      整体分五大块：
+#        1) 请求数据：新请求（全量）+ 老请求（增量）
+#        2) 本步算多少：num_scheduled_tokens（核心中的核心）
+#        3) 投机解码：scheduled_spec_decode_tokens
+#        4) 多模态 / encoder：scheduled_encoder_inputs 等
+#        5) 副作用指令：结束请求、释放 encoder 缓存、清零新块、CoW 拷贝
+#      第 5 类尤其容易被忽略：SchedulerOutput 不只是"描述"，
+#      它还携带**要 worker 执行的动作指令**。
 @dataclass
 class SchedulerOutput:
+    # [CN] 只在本轮**第一次**出现：带完整 prompt 数据，worker 会缓存下来。
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
     # need to re-send it every scheduling step.
     scheduled_new_reqs: list[NewRequestData]
+    # [CN] 之前调度过的：因为数据已在 worker 缓存，这里只发**差异部分**，
+    #      把每步的通信量压到最小。
     # list of the requests that have been scheduled before.
     # Since the request's data is already cached in the worker processes,
     # we only send the diff to minimize the communication cost.
     scheduled_cached_reqs: CachedRequestData
 
+    # [CN] **本轮给每个请求算多少 token** —— 整个调度器最核心的产物。
+    #        prefill 阶段：可能是一整个 chunk（受 max_num_batched_tokens 限制）
+    #        decode 阶段：通常是 1（投机解码时含草稿 token）
     # req_id -> num_scheduled_tokens
     # Number of tokens scheduled for each request.
     num_scheduled_tokens: dict[str, int]
+    # [CN] 所有请求本轮 token 数之和，决定这一批的形状（也决定是否空转）。
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int
+    # [CN] 投机解码的草稿 token；没有草稿的请求不出现在这个 dict 里
+    #      （用 in 判断而不是取 None）。
     # req_id -> spec_token_ids
     # If a request does not have any spec decode tokens, it will not be
     # included in the dictionary.
     scheduled_spec_decode_tokens: dict[str, list[int]]
+    # [CN] 本步要过 encoder 的多模态输入下标。
+    #      例：某个请求带 3 张图，本步只需要处理第 0、2 张 -> [0, 2]。
     # req_id -> encoder input indices that need processing.
     # E.g., if a request has [0, 1], it could mean the vision encoder needs
     # to process that the request's 0-th and 1-th images in the current step.
     scheduled_encoder_inputs: dict[str, list[int]]
+    # [CN] 每个 KV cache group 里**所有请求共享的前缀块数**。
+    #      cascade attention 会用这个数把共享前缀单独算一次，省掉重复计算。
     # Number of common prefix blocks for all requests in each KV cache group.
     # This can be used for cascade attention.
     num_common_prefix_blocks: list[int]
 
+    # [CN] 上一轮到本轮之间**结束**的请求。worker 收到后清理它们的缓存状态
+    #      （比如 CUDA graph 里的 slot、持久 batch 里的行）。
+    #      注意这是"延迟一拍"的：请求先结束，下一步才通知清理。
     # Request IDs that are finished in between the previous and the current
     # steps. This is used to notify the workers about the finished requests
     # so that they can free the cached states for those requests.
     finished_req_ids: set[str]
+    # [CN] 要从 encoder 缓存里释放的 mm_hash 列表（请求结束 / 抢占时清）。
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 
+    # [CN] 本轮被抢占的请求（仅 v2 runner 用）。
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
 
+    # [CN] 本批里是否有结构化输出请求。只在 async scheduling 下设置 ——
+    #      因为那时要在 GPU 跑之前就决定要不要算 grammar 位掩码。
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.
     has_structured_output_requests: bool = False
 
+    # [CN] 请求还没拿到"算位掩码所需的全部输出 token"。
+    #      为 True 时本步不能算 grammar，要等下一步。
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.
     pending_structured_output_tokens: bool = False
 
+    # [CN] 投机解码中被拒绝的 token 数，用于修正接受率统计
+    #      （不修正的话，被拒的那部分会被算成"有效输出"，指标虚高）。
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
 
+    # [CN] 本步是否有请求需要**同步**加载 KV（connector 的 load_async=False）。
+    #      有同步加载时，这一步的耗时会变长，调度/统计上要区别对待。
     # Whether any scheduled request consumes KV that the connector loads
     # synchronously during this step (load_async=False).
     has_sync_kv_loads: bool = False
@@ -280,21 +347,30 @@ class SchedulerOutput:
     ec_connector_metadata: ECConnectorMetadata | None = None
     # EC Cache Manager metadata
     ec_manager_metadata: EncoderCacheManagerMetadata | None = None
+    # [CN] 本步新分配的 block，worker 要**先清零**再用。
+    #      为什么要清零：块池复用旧块，里面残留着上一次的数据；
+    #      如果不清零，attention / SSM 会读到脏数据（NaN）直接输出崩坏。
+    #      这是块池复用带来的必要代价。
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # [CN] **写时拷贝（CoW）** 指令：在清零之后、前向之前执行。
+    #      典型场景是前缀共享 / beam search 分叉时避免整块复制。
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # [CN] 强调一次：这个字段只在调度器内部流转，到 worker 前必为 None。
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 
+    # [CN] 动态投机解码：调度器为**下一步**选定的 K（草稿长度）。
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # [CN] 空输出哨兵（比如纯 dummy batch 时）。
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -310,6 +386,8 @@ class SchedulerOutput:
         )
 
 
+# [CN] 结构化输出的 grammar 位掩码，顺序与 structured_output_request_ids 一致。
+#      它在 CPU 上算、与 GPU 前向并行，算完后交给 sampler 屏蔽非法 token。
 @dataclass
 class GrammarOutput:
     # ids of structured output requests.

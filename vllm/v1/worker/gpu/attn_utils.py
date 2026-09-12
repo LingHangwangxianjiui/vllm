@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：V2 runner 的 attention 初始化与 metadata 构造。
+# [CN] 把 gpumodel_runner.py 里散落的 initialize_attn_backend /
+# [CN] _build_attention_metadata 抽成纯函数，便于复用与测试。
+# [CN] 三条主线：
+# [CN]   1) 发现 attention group（按 后端 + spec + Q 头数 聚类）；
+# [CN]   2) 决定 kernel 块大小与 CUDA graph 支持度；
+# [CN]   3) 为每层构造 metadata（同一 group 内共享一份）。
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -33,6 +41,9 @@ from vllm.v1.worker.utils import (
 
 
 @dataclass(frozen=True)
+# [CN] 「本模型对 CUDA graph 的支持度」= 所有 backend 里最悲观的那个。
+# [CN] narrow() 让「不经过 init_attn_backend 建立的 group」（如 encoder-only 层）
+# [CN] 也能参与这个决策，避免漏掉某个不支持图的后端。
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
@@ -50,6 +61,8 @@ class AttentionCGSupportInfo:
         return self
 
 
+# [CN] 收集各层 KV cache 规格。声明了共享目标的层直接跳过 ——
+# [CN] 对 KV cache 管理来说它「不存在」，从而省下显存。
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
@@ -75,6 +88,10 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     }
 
 
+# [CN] 三阶段：
+# [CN]   1) 发现各 KV cache group 内的 attention group；
+# [CN]   2) 为每个 group 挑一个「组内所有后端都支持」的 kernel 块大小；
+# [CN]   3) 建 metadata builder 并汇总 CUDA graph 支持度。
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -111,6 +128,9 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
+            # [CN] 按「每 rank 的 Q 头数」再细分 group：
+            # [CN] 草稿层的头数可能与目标层不同，而 builder 的 scratch 是按头数定尺寸的，
+            # [CN] 混在一组会尺寸错配。
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate
             # metadata builders.
@@ -144,8 +164,12 @@ def init_attn_backend(
                 # Microbatches build attention metadata concurrently, and some
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
+                # [CN] 每个微批次一个 builder：微批次并发构造 metadata，
+                # [CN] 而某些 builder（如 MLA）会把 prepared metadata 存在自己身上，必须隔离。
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
             )
+            # [CN] 但 workspace 可以共享：所有微批次的 attention 都提交到同一个计算流，
+            # [CN] 是串行写的，与跨 step 复用的情形一样。
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
@@ -159,6 +183,8 @@ def init_attn_backend(
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
+# [CN] 取所有 backend 中「最不支持 CUDA graph」的那个作为整体结论：
+# [CN] 只要有一层不能入图，整条前向就不能整图捕获。
 def get_attn_cg_support(
     attn_groups: list[list[AttentionGroup]],
     vllm_config: VllmConfig,
@@ -187,6 +213,9 @@ def get_attn_cg_support(
     )
 
 
+# [CN] 哪些后端要求 CPU 侧 query_len 必须与设备侧完全一致。
+# [CN] 自适应验证会把 CPU 侧偏移压缩掉，这类后端就不兼容。
+# [CN] 注意：有些模型硬编码了后端，不走 attention selector，因此这里要再查一遍。
 def get_query_lens_mismatch_unsupported_backend(
     attn_groups: list[list[AttentionGroup]],
     checked_layer_names: set[str] | None = None,
@@ -208,6 +237,9 @@ def get_query_lens_mismatch_unsupported_backend(
     return None
 
 
+# [CN] 分配 KV cache 显存并绑定到各层。
+# [CN] 双注意力模型（LongCat-Flash）每个 decoder layer 有两个 Attention 模块，
+# [CN] 所以层名里带两个整数，bind 时要传 num_attn_module=2。
 def init_kv_cache(
     runner_kv_caches: list[torch.Tensor | list[torch.Tensor]],
     forward_context: dict[str, Any],
@@ -256,6 +288,10 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+# [CN] 为每个 KV cache group 构造 CommonAttentionMetadata，
+# [CN] 再交给该 group 内各 attention group 的 builder 产出各自的 metadata，
+# [CN] 最后按层名展开成 {layer_name: metadata}。
+# [CN] 同一 attention group 内的所有层共享同一份 metadata（省内存与构造时间）。
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -290,6 +326,8 @@ def build_attn_metadata(
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        # [CN] 混合草稿器里不同 group 的因果性可能不同（SWA 与 full 混用），
+        # [CN] 因此 causal 允许是 dict，按 group id 取值。
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
@@ -350,6 +388,8 @@ def build_attn_metadata(
     return attn_metadata
 
 
+# [CN] PrefixLM：多模态 token 段内部允许双向注意力。
+# [CN] 超过 sliding_window 的段会被跳过，否则靠前的 token 会跨越整张图去 attend。
 def compute_mm_prefix_ranges(
     req_ids: list[str],
     mm_features: dict[str, list[MultiModalFeatureSpec]],

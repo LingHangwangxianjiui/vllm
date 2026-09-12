@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：V2 runner 的块表与 slot mapping。
+# [CN] 与旧版 v1/worker/block_table.py 的三个关键差异：
+# [CN]   1) 块表本身是 StagedWriteTensor —— 增删块是「差量写」而非整体重传；
+# [CN]   2) 多 KV cache group 的差量写用 FusedStagedWriter 合并成一个 kernel；
+# [CN]   3) 区分「持久块表」(block_tables) 与「前向用块表」(input_block_tables)：
+# [CN]      前者按 slot 存放，后者按 batch 行序 gather 出来，
+# [CN]      且必须是固定地址的持久张量（CUDA graph 要求）。
 from collections.abc import Iterable
 
 import torch
@@ -14,6 +22,8 @@ from vllm.v1.worker.gpu.buffer_utils import (
 )
 
 
+# [CN] 持有所有 KV cache group 的块表。注意是复数：
+# [CN] 混合注意力模型（如 Full + Sliding Window）每个 group 一张表。
 class BlockTables:
     def __init__(
         self,
@@ -45,6 +55,9 @@ class BlockTables:
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
 
+        # [CN] 一个「调度块」等于几个「kernel 块」。
+        # [CN] 调度侧可能用 256，而后端只支持 64，则 1 个调度块要拆成 4 个 kernel 块，
+        # [CN] 块表里存的必须是 kernel 块 ID。
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
         ]
@@ -69,6 +82,8 @@ class BlockTables:
                 self.device, self.num_kv_cache_groups * self.max_num_reqs
             )
 
+        # [CN] 前向用块表：由 gather_block_tables 从持久块表按 batch 行序收集而来。
+        # [CN] 必须是持久张量（地址固定），CUDA graph 才能重放。
         # Block tables used for model's forward pass.
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.input_block_tables: list[torch.Tensor] = [
@@ -84,6 +99,8 @@ class BlockTables:
 
         self.init_block_table_layout_tensors()
 
+    # [CN] 把一组张量的地址打包成 uint64 张量，供 Triton kernel 解引用。
+    # [CN] 用 uint64 而非 int64 是为了覆盖完整的地址空间。
     def _make_ptr_tensor(self, x: Iterable[torch.Tensor]) -> torch.Tensor:
         # NOTE(woosuk): Use uint64 instead of int64 to cover all possible addresses.
         return torch.tensor(
@@ -110,6 +127,8 @@ class BlockTables:
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
+    # [CN] 追加块 ID（overwrite=True 时从头覆盖，用于抢占恢复等场景）。
+    # [CN] 只是 stage，真正的 GPU 写入在 apply_staged_writes。
     def append_block_ids(
         self,
         req_index: int,
@@ -132,6 +151,8 @@ class BlockTables:
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
 
+    # [CN] 单 group 直接写（省掉每次写都要查 group 的开销）；
+    # [CN] 多 group 走融合 kernel，把 N 次 launch 合并成 1 次。
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
             return
@@ -146,6 +167,10 @@ class BlockTables:
             )
         self.num_blocks.copy_to_uva()
 
+    # [CN] 按 idx_mapping（batch 行 -> slot）把持久块表收集成前向用块表。
+    # [CN] 为什么需要：持久块表按 slot 索引，含空洞（已结束的请求留下的空位）；
+    # [CN] 而 kernel 期望的是紧凑的 [num_reqs, max_num_blocks] 布局。
+    # [CN] grid 用 num_reqs_padded 而非 num_reqs：顺带把 padding 行清零。
     def gather_block_tables(
         self,
         idx_mapping: torch.Tensor,
@@ -175,6 +200,10 @@ class BlockTables:
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
 
+    # [CN] dummy run / 图捕获用。两点必须注意：
+    # [CN]   1) 必须返回「与前向同一地址」的持久张量，不能新建；
+    # [CN]   2) 必须清零 —— 否则会把 Mamba 状态写到上一步真实批次留下的、
+    # [CN]      可能已被释放并重新分配的陈旧块 ID 上。
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.
         # Therefore, this method must return the persistent tensor
@@ -188,6 +217,10 @@ class BlockTables:
             block_table[:num_reqs].zero_() for block_table in self.input_block_tables
         )
 
+    # [CN] 计算每个 token 的 KV 写入位置（slot）。
+    # [CN] 公式：slot = block_table[req][pos // kernel_block_size] * kernel_block_size
+    # [CN]           + pos % kernel_block_size
+    # [CN] 不属于本 CP rank 或该 group 禁用 slot mapping 的位置一律写 PAD_SLOT_ID。
     def compute_slot_mappings(
         self,
         idx_mapping: torch.Tensor,
@@ -221,6 +254,8 @@ class BlockTables:
         )
         return slot_mappings[:, :num_tokens_padded]
 
+    # [CN] 刻意填充整个张量而非只填前 num_tokens 个：
+    # [CN] padding 逻辑复杂，kernel 可能访问到请求范围之外。
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.
         # This is because the padding logic is complex and kernels may access beyond
@@ -234,6 +269,8 @@ class BlockTables:
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
+# [CN] 一个 program 负责 (一个 group, 一个 batch 行) 的拷贝。
+# [CN] batch_idx >= num_reqs 的行直接清零，与「清零 padding」在同一 kernel 内完成。
 def _gather_block_tables_kernel(
     batch_idx_to_req_idx,  # [batch_size]
     src_block_table_ptrs,  # [num_kv_cache_groups]
@@ -274,6 +311,9 @@ def _gather_block_tables_kernel(
 
 
 @triton.jit
+# [CN] grid 的第二个维度是 num_reqs + 1：多出来的那一个专门负责填 padding。
+# [CN] 它从「真实 token 数」开始填 PAD_ID（不是从 padded 数开始），
+# [CN] 因为 chunked prefill 下真实与 padded 之间那段可能残留上一步的有效 slot。
 def _compute_slot_mappings_kernel(
     max_num_tokens,
     idx_mapping,  # [num_reqs]
@@ -321,6 +361,7 @@ def _compute_slot_mappings_kernel(
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
+        # [CN] 未开 CP 时位置即本地位置；开了 CP 则要做轮转换算（见 cp_utils.py）。
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
             local_positions = positions

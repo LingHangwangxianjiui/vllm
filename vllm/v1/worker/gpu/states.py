@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：新一代 runner（V2）的请求状态容器。
+# [CN] 与 v1/worker/gpu_input_batch.py 的 InputBatch 对比：
+# [CN]   这里把「每请求的持久状态」单独抽成 RequestState，
+# [CN]   且大张量（all_token_ids）刻意放在 UVA（统一虚拟寻址）内存而非显存，
+# [CN]   因为 max_num_reqs × max_model_len 可能有好几 GB。
+# [CN] 关键抽象：
+# [CN]   StagedWriteTensor —— 先在 CPU 侧 stage，再一次性 apply 到 GPU；
+# [CN]   UvaBackedTensor   —— 直接映射到 UVA，CPU/GPU 同址访问。
 import numpy as np
 import torch
 
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
+# [CN] 全部请求的持久状态（按 slot 索引，不是按 req_id 连续存放）。
+# [CN] slot 通过 free_indices 池复用，避免增删请求时移动数据。
 class RequestState:
     def __init__(
         self,
@@ -28,6 +39,7 @@ class RequestState:
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
 
+        # [CN] all_token_ids 可能数 GB，用 UVA 而非显存，省显存给 KV cache。
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
         # depending on the configured max_num_reqs and max_model_len.
         # To save GPU memory, we use UVA instead of GPU for this tensor.
@@ -37,6 +49,11 @@ class RequestState:
             device=device,
             uva_instead_of_gpu=True,
         )
+        # [CN] prompt_len 与 prefill_len 必须分清：
+        # [CN]   prompt_len  —— 用户给的 prompt 长度；
+        # [CN]   prefill_len —— 真正送进 runner 的长度（含抢占恢复时续上的输出 token）。
+        # [CN] prompt logprobs、频率惩罚等特性必须按 prompt 与输出分开处理，
+        # [CN] 混用会导致语义错误。
         # NOTE(woosuk): Distinguish clearly between prompt_len and prefill_len:
         # - prompt_len: Number of tokens in the user-provided prompt.
         # - prefill_len: Number of tokens passed into the model runner.
@@ -58,6 +75,9 @@ class RequestState:
         self.num_computed_tokens = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        # [CN] CPU 侧的「乐观镜像」：它是 GPU 真值的上界。
+        # [CN] async scheduling 下 GPU 真值可能更小（草稿被拒），CPU 先按上界算，
+        # [CN] 再由 GPU 侧修正，从而全程无需同步。
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
@@ -88,6 +108,7 @@ class RequestState:
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
 
+    # [CN] 从 free_indices 取一个 slot 挂上；prefill_len 来自 all_token_ids 长度。
     def add_request(
         self,
         req_id: str,
@@ -116,6 +137,8 @@ class RequestState:
 
         self.draft_tokens[req_idx].zero_()
 
+    # [CN] 把本步 stage 的所有写一次性提交（H2D / UVA 拷贝）。
+    # [CN] 集中提交的目的是把多次小拷贝合并，减少 launch 开销。
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()
@@ -123,6 +146,7 @@ class RequestState:
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
 
+    # [CN] 归还 slot 到 free_indices；返回被释放的槽位下标供调用方清理其它数组。
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""
         req_idx = self.req_id_to_index.pop(req_id, None)

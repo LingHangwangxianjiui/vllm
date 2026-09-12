@@ -584,6 +584,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             generated completions in the same order as the input prompts.
         """
         # 此入口要求生成式 runner；校验发生在请求预处理和入队之前。
+        # [CN] 校验 runner_type 必须为 generate，池化/打分等 runner 不支持本入口。
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError(
@@ -594,6 +595,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         # 未显式传参时，从模型配置获取默认采样参数；没有差异配置则使用
         # SamplingParams()。显式传入的参数不会在此与模型默认配置合并。
+        # [CN] 准备 SamplingParams（未显式传参则用模型默认）。
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
 

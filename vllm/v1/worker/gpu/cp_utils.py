@@ -7,20 +7,11 @@
 # [CN] 两个核心换算：
 # [CN]   1) 全局 seq_len -> 本 rank 的 local_seq_len；
 # [CN]   2) 全局 position -> 本 rank 的 slot（不属于本 rank 的给 PAD_ID）。
-
-# [CN] 文件总览：Context Parallel（CP / DCP）下的「本地视角」换算。
-# [CN] CP 把一条序列的 KV 按 interleave 粒度轮转切给各 rank，
-# [CN] 因此每个 rank 看到的 seq_len 与 slot 都不是全局值，需要换算。
-# [CN] 两个核心换算：
-# [CN]   1) 全局 seq_len -> 本 rank 的 local_seq_len；
-# [CN]   2) 全局 position -> 本 rank 的 slot（不属于本 rank 的给 PAD_ID）。
 import torch
 
 from vllm.triton_utils import tl, triton
 
 
-# [CN] 用 Triton kernel 填充持久缓冲，而不是在 Python 里算：
-# [CN] 这样 CUDA graph 捕获时可以整段重放（CUDA graph safe）。
 # [CN] 用 Triton kernel 填充持久缓冲，而不是在 Python 里算：
 # [CN] 这样 CUDA graph 捕获时可以整段重放（CUDA graph safe）。
 def prepare_dcp_local_seq_lens(
@@ -68,8 +59,6 @@ def _dcp_local_seq_lens_kernel(
 
     # [CN] 轮转分配：每 dcp_size × cp_interleave 个 token 为一轮，
     # [CN] 每轮里第 rank 段（长 cp_interleave）归本 rank。
-    # [CN] 轮转分配：每 dcp_size × cp_interleave 个 token 为一轮，
-    # [CN] 每轮里第 rank 段（长 cp_interleave）归本 rank。
     # Distribute KV cache among different ranks, in a round-robin manner.
     rounds = seq_lens // (dcp_size * cp_interleave)
     remainder = seq_lens % (dcp_size * cp_interleave)
@@ -84,8 +73,6 @@ def _dcp_local_seq_lens_kernel(
 
 
 @triton.jit
-# [CN] 返回本 rank 负责的 slot；不归本 rank 的位置返回 PAD_ID。
-# [CN] 注意 CP_SIZE == 1 时直接短路，省掉无谓的整除运算。
 # [CN] 返回本 rank 负责的 slot；不归本 rank 的位置返回 PAD_ID。
 # [CN] 注意 CP_SIZE == 1 时直接短路，省掉无谓的整除运算。
 def cp_local_slot(

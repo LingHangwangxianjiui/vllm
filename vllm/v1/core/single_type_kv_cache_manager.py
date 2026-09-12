@@ -1,5 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [CN] 文件总览：单类型 KV cache 管理器（SingleTypeKVCacheManager 家族）
+#
+# 它在栈里的位置：BlockPool（块） <- 本文件（一个 group） <- Coordinator（多 group）
+#
+# 一句话职责：**管“某一个 KV cache group”里，请求占了哪些块、能命中多长前缀**。
+# 之所以叫 single type，是因为同一个 group 里所有层的 KV 结构完全相同
+# （块大小、层数和注意力类型一致），可以统一用一套逻辑管理。
+#
+# 子类一览（每一个对应一种注意力语义）：
+#   FullAttentionManager          全注意力：块全留、命中最长连续前缀
+#     └ RSWAManager               参考滑动窗口：额外回收“中间空隙块”
+#     └ SinkFullAttentionManager  带 sink token（永久保留开头几块）的全注意力
+#     └ CircularBufferManager     环形缓冲（Mamba 之外的一类循环复用，1 块/请求）
+#         └ KpoolTailManager      Kpool 尾巴：同样是 1 块临时缓冲
+#   SlidingWindowManager          滑动窗口：只看最近 W 个 token，块可边跑边回收
+#   ChunkedLocalAttentionManager  分块局部注意力（类似 SWA，但按 chunk 对齐）
+#   MambaManager                  Mamba / 线性注意力：状态是**递推**的，不是追加的
+#   CrossAttentionManager         编码器-解码器的 cross-attention（不共享、不缓存）
+#
+# 贯穿全文件的两个抽象概念（理解子类的钥匙）：
+#   1) get_num_skipped_tokens(n)：已经算到第 n 个 token 时，
+#      有哪些 token 的 KV **永远不会被再用到**，可以释放/用 null 占位。
+#      全注意力恒为 0（都要用），SWA 返回滑出窗口的那段，Mamba 返回 n-1。
+#   2) find_longest_cache_hit()：按块哈希查前缀缓存的最长命中。
+#      各子类语义差别很大 —— 是本文件最需要逐个对照读的部分。
+
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -40,6 +66,17 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+# [CN] 抽象基类：只关心“一个 group”的 KV cache 管理。
+#
+# 子类只需要按需重写几个钩子：
+#   - find_longest_cache_hit    （必须）怎么查前缀命中
+#   - get_num_skipped_tokens    （可选）哪些 token 的 KV 不再需要（默认 0）
+#   - reachable_block_mask      （可选）稀疏保留时哪些块值得缓存（默认全缓存）
+#   - get_num_common_prefix_blocks（必须）公共前缀块数（多数直接返回 0）
+#
+# supports_fine_grained_hash_lookup：
+#   是否支持**细粒度**哈希查找（命中长度可以不是整块，而是 hash_block_size 的倍数）。
+#   只有 full attention 与 mamba 支持；SWA / chunked-local 只能整块命中。
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -48,6 +85,17 @@ class SingleTypeKVCacheManager(ABC):
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
+    # [CN] 构造。几个关键字段：
+    #   block_size          : 本 manager 真正按多大的块分配
+    #                         （注意 DCP 会把 block_size 放大 dcp_world_size 倍，
+    #                           因为一个块的 KV 被切到多个 rank 上）
+    #   scheduler_block_size: 全局调度粒度（所有 group 块大小的公倍数）
+    #   cache_hit_alignment_tokens: 命中长度要对齐到多少 token，
+    #                         默认等于 scheduler_block_size，
+    #                         后面 Coordinator 可能调细（细粒度命中场景）
+    #   _record_new_block_ids: 是否要记录“本步新分配的块 id” —— 
+    #                         worker 侧需要把这些块**清零**再写入，
+    #                         否则脏数据会被当成有效 KV 读出来
     def __init__(
         self,
         kv_cache_spec: KVCacheSpec,
@@ -136,9 +184,16 @@ class SingleTypeKVCacheManager(ABC):
         ] = []
 
     @classmethod
+    # [CN] 统计这批块里有几个是“可被驱逐的”（ref_cnt == 0 且不是 null 块）。
+    #      用途：命中到一个正待淘汰的块时，它马上会被本请求 touch 而救活，
+    #      所以在算“还需要多少空闲块”时必须把它算进可用容量里。
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
 
+    # [CN] 是否发生了**部分命中**：本地命中的 token 数不是块大小的整数倍，
+    #      说明最后一个块是“共享的”（别人也在用、且内容比我们多）。
+    #      这种情况必须做 **CoW（写时复制）**：把共享块复制一份私有的，
+    #      否则我们往里写 token 会污染别人的前缀缓存。
     def _has_partial_local_hit(
         self,
         new_computed_blocks: Sequence[KVCacheBlock],
@@ -151,6 +206,16 @@ class SingleTypeKVCacheManager(ABC):
             and num_local_computed_tokens % self.block_size != 0
         )
 
+    # [CN] 预测“还需要分配几个块”——**不改状态**，只给调度器做准入判断。
+    #
+    # 主体公式：需要 = ceil(num_tokens / block_size)
+    #            - max(可跳过的块数, 已持有块数 + 新命中块数)
+    # 其中“可跳过的块”是指滑出注意力窗口、可以直接丢弃的那些块（SWA 场景）。
+    #
+    # 两个细节：
+    #   1) 已在跑的请求（在 num_cached_block 里）不会有新命中，走快路径；
+    #   2) 命中块里 ref_cnt == 0 的那些（待淘汰）要额外计入，
+    #      因为它们虽然现在“占着位”，但马上会被本请求复用。
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -239,6 +304,14 @@ class SingleTypeKVCacheManager(ABC):
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
 
+    # [CN] 把本地前缀命中的块挂到请求名下（Coordinator 两阶段分配的第一阶段）。
+    #      步骤：跳过被滑出窗口的块 -> touch（抬高引用计数，防止被淘汰）
+    #            -> 用 null 块补齐“被跳过的位置”（保持块表下标对齐）
+    #            -> 记录 num_cached_block（这些块已经是缓存内容，不必再缓存）。
+    #
+    #      末尾的部分命中要额外记账：把“共享尾块”记进 _partial_hit_reqs，
+    #      并把 num_cached_block 回退到整块边界，
+    #      好让后续 cache_blocks 在复制完成后重新缓存那一块。
     def add_local_computed_blocks(
         self,
         request_id: str,
@@ -298,6 +371,9 @@ class SingleTypeKVCacheManager(ABC):
             self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
             self.num_cached_block[request_id] = block_idx
 
+    # [CN] 为“外部已算 token”（external，例如 KV connector 从别的实例搬来的 KV）
+    #      分配新块。必须在**所有 group 的本地命中块都 touch 完之后**才调用，
+    #      否则这里的 get_new_blocks 可能淘汰别的 group 刚命中的块（#33775）。
     def allocate_external_computed_blocks(
         self,
         request_id: str,
@@ -338,6 +414,8 @@ class SingleTypeKVCacheManager(ABC):
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
+    # [CN] 真正的分配。先处理挂起的部分命中（CoW 重定向），再补足到 num_tokens。
+    #      返回值是“本次新拿到的块”，上层拿去更新请求的块表。
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
@@ -422,6 +500,12 @@ class SingleTypeKVCacheManager(ABC):
         """Finalize a producer partial tail when its request finishes."""
         return None
 
+    # [CN] CoW 重定向：把请求块表里第 block_idx 个位置从共享的 source_block
+    #      换成私有的 cow_block，并登记一对待复制 (source, cow) 交给 worker 执行。
+    #
+    #      两端都要保持引用：source_block 保留它原本的命中引用，
+    #      cow_block 额外 +1 —— 这样即使同一 step 内有释放操作，
+    #      也不会在拷贝完成前把任一端回收掉。
     def _apply_cow(
         self,
         request_id: str,
@@ -444,6 +528,12 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_cow_copies.append((source_block, cow_block))
         cow_block.ref_cnt += 1
 
+    # [CN] 把已算好的 KV 注册进前缀缓存（写块哈希），供后续请求命中。
+    #      只处理 [num_cached_block, num_full_blocks) 这段“新变成整块”的区间。
+    #
+    #      block_mask 是稀疏保留的关键：None 表示“全部缓存”，
+    #      子类（SWA / Mamba）会返回一个布尔掩码，只缓存“将来可能被命中的块”，
+    #      从而大幅降低缓存占用。
     def cache_blocks(
         self,
         request: Request,
@@ -497,6 +587,13 @@ class SingleTypeKVCacheManager(ABC):
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
+    # [CN] 稀疏保留掩码：在 [start_block, end_block) 里，哪些块值得写哈希。
+    #      返回 None = 全部缓存（全注意力的默认行为）。
+    #      子类按自己的“命中语义”重写：
+    #        SWA   —— 一次命中需要连续 need 个块，所以只缓存每个边界前的 need 块；
+    #        Mamba —— 一次命中只需要 1 个状态块，所以每个边界只留 1 块。
+    #      reachable_boundaries 是“必须保留”的边界：
+    #        重放边界（num_prompt - 1）与跨请求的公共前缀接点。
     @classmethod
     def reachable_block_mask(
         cls,
@@ -524,6 +621,8 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
+    # [CN] 摘掉请求的全部记账（块表、缓存计数、部分命中记录）并返回它的块，
+    #      **但不归还给块池** —— 由调用方决定归还时机（异步/批量释放）。
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping and return its blocks without yet
@@ -543,6 +642,7 @@ class SingleTypeKVCacheManager(ABC):
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
+    # [CN] 释放：逆序归还（尾部先还），保证剩余块始终是一条连续前缀。
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -569,6 +669,14 @@ class SingleTypeKVCacheManager(ABC):
 
         raise NotImplementedError
 
+    # [CN] **本家族最核心的抽象方法**：按块哈希查最长前缀命中。
+    #      各子类的实现差异很大，是理解每种注意力“复用语义”的入口。
+    #
+    #      返回值里的块列表用 **null 块占位**表示“这块被跳过了/窗口外”，
+    #      这样块表长度仍然是 token 数 / block_size，下标不会错位。
+    #
+    #      drop_eagle_block：EAGLE/MTP 要丢掉最后匹配到的块，
+    #      因为草稿头需要那一个 token 的隐藏状态，必须重算。
     @classmethod
     @abstractmethod
     def find_longest_cache_hit(
@@ -624,6 +732,9 @@ class SingleTypeKVCacheManager(ABC):
 
         raise NotImplementedError
 
+    # [CN] 释放 [first_block, last_block) 区间内的块并换成 null。
+    #      **从后往前遍历**：前面的块可能在之前的调用里已被置 null，
+    #      倒着走才能把新变得可驱逐的尾部块也一并处理到。
     def _remove_blocks_in_range(
         self,
         request_id: str,
@@ -651,6 +762,11 @@ class SingleTypeKVCacheManager(ABC):
         if freed:
             self.block_pool.free_blocks(freed)
 
+    # [CN] 回收注意力窗口外的块（SWA / chunked-local / Mamba 的核心回收路径）。
+    #      “跳过多少 token”由子类 get_num_skipped_tokens 决定。
+    #      注意对 num_skipped_blocks 做了上限裁剪：
+    #      滑出的 token 可能还没分配块（例如窗口滑进了 external 区），
+    #      不能越界。
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -690,6 +806,8 @@ class SingleTypeKVCacheManager(ABC):
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
+    # [CN] 已经算到第 n 个 token 时，前多少个 token 的 KV 再也用不到。
+    #      基类（全注意力）返回 0 —— 所有 token 都要参与注意力，一个都不能扔。
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.
@@ -707,9 +825,19 @@ class SingleTypeKVCacheManager(ABC):
         return None
 
 
+# [CN] 全注意力管理器。两个特点：
+#   1) 所有块的 KV 都要保留到请求结束（get_num_skipped_tokens 恒为 0）；
+#   2) 命中是**从前往后**扫：块哈希是链式（每个块的哈希包含前缀），
+#      所以一旦某块没命中，后面必然也不命中 —— 可以直接 break。
+#      这也是它是唯一支持“细粒度哈希查找”的原因之一。
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    # [CN] 两阶段查找：
+    #   阶段 1：从头连续匹配整块，遇到第一个 miss 就停（链式哈希保证后面全 miss）；
+    #   阶段 2（仅细粒度模式）：在第一个未命中的整块内部，
+    #          从高到低试探各个 hash 边界，取最长可命中的那一个。
+    #  最后按 alignment_tokens 向下取整，并把块表截断到新长度。
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -762,6 +890,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         # Phase 1: longest run of cached full blocks from the start. A missing
         # block implies every later block misses too (chained hashes).
+        # [CN] 阶段 1：连续整块匹配。max_length // block_size 限制最多看几块。
         for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
             cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
             if not cached_block:
@@ -797,6 +926,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         # drop one hash unit when fine-grained (the tail block's KV is
         # append-only, so it still covers the reduced length), else one cache
         # block.
+        # [CN] EAGLE：丢掉一个单位（细粒度时是 1 个 hash 单位，否则 1 个整块），
+        #      让最后那点 token 重算，草稿头才能拿到隐藏状态。
         if drop_eagle_block and hit_length > 0:
             hit_length -= min(alignment_tokens, block_size)
         # Round down to the alignment; a no-op when fine-grained (hits land on
@@ -808,6 +939,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             del computed[num_blocks:]
         return computed_blocks, hit_length
 
+    # [CN] 先走基类的整块缓存；若本 group 的块比 hash 块大，
+    #      再单独把“prompt 尾部落在块中间”的那一段注册为部分哈希条目。
     def cache_blocks(
         self,
         request: Request,
@@ -820,6 +953,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             return
         self._cache_partial_tail_block(request, num_tokens)
 
+    # [CN] 缓存“部分尾块”：prompt 长度不是块大小的整数倍时，
+    #      最后一个 hash 边界落在某个块**内部**。
+    #      只注册**最后一个**边界 —— 同一块内的中间边界不注册，
+    #      因为它们共享同一份物理 KV，注册多个会造成“命中到错误内容”。
     def _cache_partial_tail_block(
         self,
         request: Request,
@@ -850,6 +987,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             block_size=self.block_size,
         )
 
+    # [CN] 公共前缀块数：从头数，直到某个块的引用计数 != 在跑请求数为止
+    #      （ref_cnt == 所有请求都在用 => 它是公共前缀的一部分）。
+    #      cascade attention 用它决定“公共前缀”那段可以复用一次计算。
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
         num_common_blocks = 0
@@ -861,6 +1001,11 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         return num_common_blocks
 
 
+# [CN] R-SWA（Reference Sliding Window Attention，参考滑动窗口）。
+#      与普通 SWA 的区别：普通 SWA 从头滑，R-SWA 保留开头的 prefix 段，
+#      只回收“prefix 尾部”与“当前窗口”之间的**中间空隙块**。
+#      效果：单请求 KV 占用从 O(解码长度) 降为 O(prefix + 窗口)，
+#      长输出场景下省得非常可观。
 class RSWAManager(FullAttentionManager):
     """KV cache manager for Reference Sliding Window Attention (R-SWA).
 
@@ -907,6 +1052,15 @@ class RSWAManager(FullAttentionManager):
         self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
 
+# [CN] 滑动窗口管理器。与全注意力的根本区别：
+#   请求只需要最近 W 个 token 的 KV，更早的块**可以边跑边扔**。
+#
+# 这带来两个连锁反应：
+#   1) 命中判定：不能像全注意力那样“从头连续匹配”，
+#      而是需要**连续 C 个块都命中**才算命中（C = 覆盖窗口所需的块数），
+#      因为只拿最后 1 块是凑不出一个完整窗口的；
+#   2) 查找方向：从右往左扫，找到即停 —— 因为窗口只需要尾部那段，
+#      越靠右的命中价值越高。
 class SlidingWindowManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
@@ -916,6 +1070,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # cached blocks.
         self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens
 
+    # [CN] 一次命中需要多少个**连续**块：ceil((窗口 - 1) / 块大小)。
+    #      EAGLE 时 +1（先多匹配一块再丢掉，理由同前）。
     @classmethod
     def _contiguous_blocks_for_hit(
         cls, window_size: int, block_size: int, use_eagle: bool
@@ -929,6 +1085,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             blocks += 1
         return blocks
 
+    # [CN] 从右往左扫，维护“当前连续命中了几块”：
+    #      命中就 +1，miss 就归零；累计到 C 块即成功，截断尾部并退出。
+    #      若整轮都没凑够 C 块，也保留已连续命中的前缀部分（聊胜于无）。
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -1027,6 +1186,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         hit_length = len(computed_blocks[0]) * block_size
         return computed_blocks, hit_length
 
+    # [CN] SWA 的稀疏保留掩码：
+    #      一次命中需要连续 need 块，所以每个对齐边界前 need 个块才值得缓存；
+    #      其余块将来也不可能凑出命中，缓存它们纯属浪费。
+    #      另外一定会保留 reachable_boundaries（重放边界 / 公共前缀接点）前的块，
+    #      否则稀疏保留会把“确定能复用”的那次机会也一起省掉。
     @classmethod
     def reachable_block_mask(
         cls,
@@ -1109,6 +1273,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         return mask
 
+    # [CN] 滑出窗口的 token 数。注意末尾 extra_retained_tokens：
+    #      多模块 MTP 可能回退重算最后几个 token，所以尾部要**多留**一段不回收，
+    #      否则重算时发现 KV 已经被扔了。
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.
@@ -1146,6 +1313,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
         )
 
+    # [CN] SWA 的前缀块是 null 占位（不是真块），不能用 ref_cnt 统计，
+    #      所以直接返回 0：暂不支持 cascade attention + sliding window。
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
         NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
@@ -1156,6 +1325,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+# [CN] 环形缓冲管理器：每个请求**只占 1 个块**，循环覆盖写入，
+#      因此天然不支持前缀缓存（内容会被后来的 token 覆盖）。
+#      适用于某些特定的局部注意力实现（如部分 sink / kpool 类结构）。
 class CircularBufferManager(FullAttentionManager):
     """Claims the ring's single block per request; prefix caching disabled."""
 
@@ -1243,10 +1415,16 @@ class CircularBufferManager(FullAttentionManager):
         return 0
 
 
+# [CN] Kpool 尾巴：同样是“1 块/请求”的环形临时缓冲，
+#      只是对应不同的 spec 类型（KpoolTailSpec）。
 class KpoolTailManager(CircularBufferManager):
     """One-block circular scratch manager for ``KpoolTailSpec``."""
 
 
+# [CN] 分块局部注意力：把序列切成固定大小的 chunk，
+#      注意力只在“当前 chunk 及之前已完成的 chunk 边界”内做。
+#      与 SWA 的区别：窗口是按 chunk **对齐**的，而不是滑动的，
+#      所以“哪些块用不到”可以直接用除法算出来。
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
@@ -1352,6 +1530,9 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         hit_length = len(computed_blocks[0]) * kv_cache_spec.block_size
         return computed_blocks, hit_length
 
+    # [CN] 跳过的是“当前 chunk 左边”的所有完整 chunk：
+    #      (num_computed_tokens // chunk_size) * chunk_size。
+    #      注意与 SWA 的区别：这里不减窗口、不减 1，因为 chunk 是硬对齐的。
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.
@@ -1405,6 +1586,19 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         return 0
 
 
+# [CN] Mamba / 线性注意力管理器 —— **本文件最特殊的一个**。
+#
+# 与注意力的本质区别：Mamba 的“状态”是**递推**的，不是追加的。
+#   注意力：第 i 个 token 的 KV 独立存在，可以任意复用前 k 个；
+#   Mamba  ：状态是“读到第 i 个 token 时的压缩结果”，只能整块复用，
+#            而且必须**恰好落在某个边界上**才有意义。
+#
+# 由此产生三个特殊机制：
+#   1) get_num_skipped_tokens = n - 1：只需要最新那一个状态，历史全扔；
+#   2) mamba_cache_mode == 'align' 时，块表**不是 append-only** —— 
+#      中间状态会被清空释放、投机块会原地挪位；
+#   3) 因此外部 KV connector 无法靠“位置”定位状态块，
+#      必须靠 _pending_boundary_state_offloads 显式交接（请求,组,块,边界token）。
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
@@ -1440,6 +1634,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
 
+    # [CN] Mamba 的命中查找是**从右往左找单个块**：
+    #      找到最后一个命中的块即可（状态块本身就是完整的“读到这里”的结果），
+    #      然后在前面补 null 占位，使块表长度与 token 数对应。
+    #      细粒度模式下则按 hash 单位从高到低试探，取最长可命中边界。
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -1519,6 +1717,9 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return computed_blocks, hit_length
 
+    # [CN] Mamba 的稀疏保留：一次命中只需要**一个**状态块（不需要连续窗口），
+    #      所以每个边界只保留 1 块，省得比 SWA 更激进。
+    #      reachable_boundaries 同 SWA —— 重放边界与公共前缀接点必留。
     @classmethod
     def reachable_block_mask(
         cls,
@@ -1579,6 +1780,11 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return mask
 
+    # [CN] Mamba 的回收：除了基类的逻辑，align 模式还要额外释放
+    #      “前前一步分配的状态块”（last_state_block_idx）。
+    #      原因：align 模式下每步把状态从上一块拷到新块，
+    #      拷完上一块就没用了；但 prefill 期间块可能不连续，
+    #      所以必须靠记录的 idx 精确定位，不能按长度推算。
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -1615,6 +1821,10 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return 0
 
+    # [CN] 是否需要写一个“内部 checkpoint 块”：
+    #      为了让长 prefill 也能部分复用，Mamba 会在特定边界额外存一份状态。
+    #      判定条件包括 spec 是否开启、该位置是否符合对齐要求、
+    #      以及目标块当前是否为空/是否会被投机块覆盖。
     def _needs_internal_checkpoint(
         self,
         request_id: str,
@@ -1646,6 +1856,15 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
 
+    # [CN] Mamba 的分配预测，头部有一处很“脏”但很实在的技巧：
+    #      如果将要命中的块是**本 step 内别的请求刚缓存的**，
+    #      直接返回 num_gpu_blocks + 1 —— 一个必然超过池容量的数，
+    #      于是调度器会认为“块不够”，把这个请求推到下一步再调度。
+    #      为什么：本 step 内新写的 Mamba 状态尚未稳定（还要被本步前向覆盖），
+    #      此时命中它会读到错误内容。宁可延后一步，也不能读脏。
+    #
+    #      align 模式还额外处理：lookahead token 不分配块（会破坏对齐）、
+    #      投机块要预留、checkpoint 块要预留。
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1742,6 +1961,14 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             return num_new_blocks + num_evictable_computed_blocks
 
+    # [CN] Mamba 的实际分配（align 模式相当复杂，按这个顺序读）：
+    #   1) 若块已够且无部分命中/checkpoint，直接返回 []（本步不新分配）；
+    #   2) 记录 last_state_block_idx（本步状态所在的块，下一步用来拷贝）；
+    #   3) 补 null 占位（滑过的中间状态位置），注意跳过 checkpoint 块；
+    #   4) 已在跑的请求：把独占的投机暂存块**原地挪位**到新位置；
+    #   5) 处理部分命中的 CoW —— 已在跑的请求不能换块（worker 块表是
+    #      append-only），所以改为把缓存条目**迁移**到新块（move_block_hashes）；
+    #      新请求则直接替换块表项（_apply_cow）。
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
@@ -1868,6 +2095,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
 
+    # [CN] 投机暂存块挪位：把它从旧下标摘下、追加到末尾，原位置填 null。
+    #      前提是这块“独占且没有哈希”—— 否则挪动会破坏别人的缓存引用。
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
     ) -> None:
@@ -1879,6 +2108,9 @@ class MambaManager(SingleTypeKVCacheManager):
         req_blocks.append(block)
         req_blocks[block_idx] = self._null_block
 
+    # [CN] 请求结束时结算“部分尾部”的卸载：
+    #      只有当在途 token 为 0 且已算 token 正好等于边界时才成立，
+    #      否则那块状态还会被继续覆盖，交出去没有意义。
     def finalize_partial_tail_offload(
         self,
         request_id: str,
@@ -1895,6 +2127,9 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         return self.kv_cache_group_id, source_block, boundary_tokens
 
+    # [CN] Mamba 的记账清理：除了基类的几项，还要清掉本请求尚未被领取的
+    #      边界状态交接记录 —— 块马上要回到池子里了，
+    #      不能让 connector 之后拿走一块“可能已经被别人复用”的块。
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
@@ -1913,6 +2148,7 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
         return super().pop_blocks_for_free(request_id)
 
+    # [CN] Mamba 只需要**最新**那一个状态，所以前面 n-1 个 token 的状态全可扔。
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens whose mamba state are not needed anymore. Mamba only
@@ -1921,6 +2157,10 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
+    # [CN] Mamba 的缓存：写完哈希后，把这些块记进 cached_blocks_this_step，
+    #      用来实现前面说的“本 step 内新缓存的块不许立刻被别人命中”。
+    #      align 模式还要为每个保留下来的边界登记一条交接记录，
+    #      供外部 KV connector 精确卸载（因为块表不连续、不能靠位置推断）。
     def cache_blocks(
         self,
         request: Request,
@@ -1959,9 +2199,16 @@ class MambaManager(SingleTypeKVCacheManager):
                         )
                     )
 
+    # [CN] 每步开始清空“本 step 缓存的块”—— 这些块过了本步就允许被命中了。
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
 
+    # [CN] 缓存部分尾块。两种情形：
+    #      a) 有 checkpoint：把预留块按 checkpoint 边界**重新定键**
+    #         （replace_existing_hashes=True，因为旧键已经失效）；
+    #      b) 无 checkpoint：prompt 尾部落在块内时，注册一个部分哈希，
+    #         并把该请求标为“生产者”（producer），
+    #         CoW 完成后把那块交给 connector 卸载。
     def _cache_partial_tail_block(
         self,
         request: Request,
@@ -2026,6 +2273,11 @@ class MambaManager(SingleTypeKVCacheManager):
         return partial_hash
 
 
+# [CN] Cross-attention（编码器-解码器）管理器。
+#      关键认知：cross-attention 的 K/V 来自 **encoder 输出**，
+#      每个请求的输入（图片/音频）都不一样，所以：
+#        - 不共享、不做前缀缓存；
+#        - 大小只跟 encoder token 数有关，与解码长度无关（一次性分配）。
 class CrossAttentionManager(SingleTypeKVCacheManager):
     """Manager for cross-attention KV cache in encoder-decoder models."""
 
@@ -2089,6 +2341,9 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         raise NotImplementedError("CrossAttentionManager does not support caching")
 
 
+# [CN] 带 sink 的全注意力：永久保留最开头 sink_len 个 token 的 KV
+#      （attention sink 现象：开头的 token 承载了大量注意力权重，扔掉会崩）。
+#      实现上直接从空闲队列**预先取走**这几块，永不参与淘汰。
 class SinkFullAttentionManager(FullAttentionManager):
     def __init__(
         self,
@@ -2115,6 +2370,14 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
+# [CN] 工厂：按 KVCacheSpec 的类型查注册表拿 manager 类。
+#      用注册表而不是 if/elif，是为了让**外部（平台/插件）可以注册自己的 spec**。
+#
+#      这里还负责给 SWA / chunked-local 设置 max_admission_blocks_per_request：
+#      这两个类型会**边跑边回收块**，所以“单请求最多占多少块”不是
+#      max_model_len / block_size，而是一个更小的“回收感知”上限。
+#      这个上限必须和启动时计算池大小用的是**同一个函数**，
+#      否则两边漂移会重新引入 #39734 那类死锁 / 中途 OOM。
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_in_flight_tokens: int,
@@ -2160,6 +2423,14 @@ def get_manager_for_kv_cache_spec(
     return manager
 
 
+# [CN] 内置 spec -> manager 的注册表初始化。
+#
+#      uniform_type_base_spec 的作用：**分组归并**。
+#      同一 uniform 基类的 spec 会被归到同一 KV cache group，
+#      这样 MLA / RSWA / Sink 等 FullAttention 的子类可以和普通 full attention
+#      合并处理，减少 group 数量（group 越少，调度与块表越简单）。
+#
+#      最后一行：交给当前平台注册自己的自定义 spec（插件扩展点）。
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
     KVCacheSpecRegistry.register(

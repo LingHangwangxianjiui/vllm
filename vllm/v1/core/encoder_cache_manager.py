@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [CN] 文件总览：多模态 **encoder 输出** 的缓存管理器。
+#
+# 它管理的不是 KV cache，而是“视觉/音频编码器的输出 embedding”。
+# 为什么需要缓存：同一张图可能出现在多条请求里（尤其是多轮对话中，
+# 图片被反复携带），每次都重跑一遍 vision encoder 非常贵。
+#
+# 三个与 KV cache 不同的设计点：
+#   1) 缓存粒度是**多模态 item**（一张图），由 mm_hash 标识，不是 token；
+#   2) 容量按 **encoder embedding 数** 计，与文本 token 无关；
+#   3) 淘汰是**分配时触发**的（can_allocate 里需要空间才淘汰），
+#      而不是后台 LRU 线程。
+#
+# 记账三件套：
+#   num_free_slots     —— 完全空闲的容量；
+#   num_freeable_slots —— “空闲 + 可回收”（引用计数为 0 的条目也算可用）；
+#   freeable           —— 按插入顺序排的 OrderedDict，实现 FIFO 淘汰。
+
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -66,12 +83,15 @@ class EncoderCacheManager:
             last call to get_freed_mm_hashes(). This list is cleared on return.
     """
 
+    # [CN] 工厂方法：给平台/子类一个替换实现的入口（见文件末尾的 enc-dec 子类）。
     @classmethod
     def create_manager(
         cls, *, cache_size: int, vllm_config: "VllmConfig"
     ) -> "EncoderCacheManager":
         return cls(cache_size=cache_size)
 
+    # [CN] 构造。注意 num_freeable_slots 初始等于 cache_size —— 
+    #      此时没有任何已缓存内容，所谓“可回收”就是全部容量。
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
         self.num_free_slots = cache_size
@@ -86,6 +106,9 @@ class EncoderCacheManager:
         self.freeable: OrderedDict[str, int] = OrderedDict()
         self.freed: list[str] = []
 
+    # [CN] 全量清空。**权重更新后必须调用**：
+    #      旧权重算出的 embedding 还在缓存里，不清的话请求会读到过期结果。
+    #      这是 RL / 在线权重更新场景里最容易漏掉的一步。
     def reset(self) -> None:
         """Reset the encoder cache to its initial state.
 
@@ -99,6 +122,11 @@ class EncoderCacheManager:
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
 
+    # [CN] 查询“这个多模态 item 的 encoder 输出是否已缓存”，命中则登记引用。
+    #
+    #      关键分支：条目存在但引用集为空（说明它已被“逻辑释放”、
+    #      只是还没被真正淘汰）—— 此时要把它从 freeable 里取回来，
+    #      并相应减少 num_freeable_slots。这就是“复用待淘汰条目”的机制。
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         """Check if encoder output for a specific multimodal input is cached.
 
@@ -128,6 +156,18 @@ class EncoderCacheManager:
         self.request_cached_ids.setdefault(request.request_id, set()).add(input_id)
         return True
 
+    # [CN] 准入检查 + 就地淘汰。返回值 True 表示“空间够了（必要时已淘汰）”。
+    #
+    #      两级容量判断：
+    #        num_free_slots    够 -> 直接返回 True（不动任何状态）；
+    #        num_freeable_slots 也不够 -> 返回 False（真的塞不下）；
+    #        中间情况 -> 从 freeable 头部（最老）开始淘汰，直到够。
+    #
+    #      两个容易混淆的点：
+    #        1) 这里**只改记账**，不释放显存；
+    #           真正的释放要等 scheduler 把 freed 列表交给 worker；
+    #        2) encoder_compute_budget 是“本步最多能算多少 encoder token”的
+    #           预算，和缓存容量是两个独立维度 —— 都可能成为瓶颈。
     def can_allocate(
         self,
         request: Request,
@@ -189,6 +229,9 @@ class EncoderCacheManager:
             self.num_free_slots += num_free_embeds
         return True
 
+    # [CN] 正式占位（在 can_allocate 返回 True 之后调用）。
+    #      同时扣减 num_free_slots 与 num_freeable_slots：
+    #      因为刚占用的这部分**暂时不可回收**（有请求在引用它）。
     def allocate(self, request: Request, input_id: int) -> None:
         """Allocate cache space for a multimodal input's encoder output.
 
@@ -217,10 +260,20 @@ class EncoderCacheManager:
         self.num_free_slots -= num_encoder_embeds
         self.num_freeable_slots -= num_encoder_embeds
 
+    # [CN] 该请求当前持有哪些多模态 item 的缓存引用。
     def get_cached_input_ids(self, request: Request) -> set[int]:
         """Get all cached multimodal input IDs for a request."""
         return self.request_cached_ids.get(request.request_id, set())
 
+    # [CN] 释放**一个**引用。注意它只做“逻辑释放”：
+    #      引用集空了就放进 freeable、增加 num_freeable_slots，
+    #      但物理显存要等到 can_allocate 真的需要空间时才回收。
+    #
+    #      末尾那个 any(...) 检查很值得注意：
+    #      cached 记录的是“引用它的**请求**”，不是“出现次数”。
+    #      如果同一个请求里这张图出现了多次（多轮对话把图带上），
+    #      只要还有一处没释放，就不能让条目变成可淘汰 —— 
+    #      否则请求后面还会用到它，encoder 就白重算一次。
     def free_encoder_input(self, request: Request, input_id: int) -> None:
         """Free the request's reference to the encoder input (`mm_data`)
 
@@ -259,6 +312,8 @@ class EncoderCacheManager:
             self.freeable[mm_hash] = num_encoder_embeds
             self.num_freeable_slots += num_encoder_embeds
 
+    # [CN] 释放请求持有的**全部**引用（请求结束/取消/abort 时调用）。
+    #      同样只是逻辑释放，数据留在内存里等下次分配时再淘汰。
     def free(self, request: Request) -> None:
         """Free all encoder input cache reference held by *request*.
 
@@ -271,6 +326,11 @@ class EncoderCacheManager:
         for input_id in list(self.get_cached_input_ids(request)):
             self.free_encoder_input(request, input_id)
 
+    # [CN] 取出并清空“本轮真正被淘汰的 mm_hash 列表”，交给 worker 释放显存。
+    #
+    #      末尾的过滤（mm_hash not in self.cached）很关键：
+    #      同一次调度 pass 里，一个刚被淘汰的条目**可能又被重新分配**了，
+    #      这种情况不能让 worker 去释放 —— 否则刚写进去的内容就没了。
     def get_freed_mm_hashes(self) -> list[str]:
         """Get and clear the list of recently freed encoder cache entries.
 
@@ -290,6 +350,16 @@ class EncoderCacheManager:
         return None
 
 
+# [CN] 计算 encoder 的两个预算（单位都是“输入序列里的 token 数”）：
+#       compute budget —— 单步最多能算多少 encoder token；
+#       cache size    —— encoder 缓存总容量。
+#
+#       两者都取 max(配置值, 单个 item 的最大 token 数)：
+#       因为哪怕配置得很小，也至少要装得下**一个**最大的多模态 item，
+#       否则这条请求永远无法调度（死锁）。
+#
+#       另外：若禁用了 chunked mm input，就必须保证一个 item 能一步算完，
+#       否则直接报错而不是运行时卡死。
 def compute_mm_encoder_budget(
     scheduler_config: "SchedulerConfig",
     mm_max_toks_per_item: Mapping[str, int],
@@ -344,6 +414,14 @@ def compute_mm_encoder_budget(
 # use the manager for scheduling purposes. Encoder-decoder models will eventually
 # utilize the cache and this class will fold into EncoderCacheManager, as
 # differences with MM models shrink.
+# [CN] 编码器-解码器模型（如 Whisper）的临时实现：
+#      这类模型的 encoder 输出**不跨请求复用**，所以只借用调度框架，
+#      不做真正的缓存（check_and_update_cache 恒返回 False）。
+#
+#      它也因此需要一套“延迟一拍”的释放机制（见 get_freed_mm_hashes）：
+#      本步分配的条目要等**下一步**才能释放，
+#      因为真正的释放在 runner 里发生在“模型执行之前”，
+#      立刻释放会把本步还要用的东西删掉。
 class EncoderDecoderCacheManager(EncoderCacheManager):
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
@@ -390,6 +468,9 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
     def get_cached_input_ids(self, request: Request) -> set[int]:
         return set(range(len(request.mm_features)))
 
+    # [CN] 延迟一拍的释放：返回上一步的 allocated，把本步的存起来下次再还。
+    #      这样 worker 侧总在“模型执行之前”释放，且释放的一定是
+    #      已经用过一轮的条目。
     def get_freed_mm_hashes(self) -> list[str]:
         # As encoder cache is not used for enc-dec models, we can free the entries here
         # The actual free happens in the runner, *before* the model is executed.

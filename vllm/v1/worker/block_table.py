@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [CN] 文件总览：worker 侧的 **block table**（块表）与 slot mapping。
+#
+# 位置：调度层（v1/core）决定“请求用哪些块”，本文件负责把结论
+#       **翻译成 attention kernel 能直接读的 GPU 张量**：
+#         block_table : [max_num_reqs, max_num_blocks_per_req] 的 int32 表，
+#                       第 i 行是第 i 个请求用到的块 id 序列；
+#         slot_mapping: [num_tokens] 的 int64 表，
+#                       第 j 个元素是第 j 个 token 应该写到 KV cache 的哪个槽位。
+#
+# 两个容易混淆的“块大小”：
+#   block_size        —— **kernel** 的块大小（注意力算子要求的大小）；
+#   kv_cache_block_size —— **分配/管理**的块大小（v1/core 那边的块）。
+#   两者不同时（hybrid blocks），一个管理块要摊成多个 kernel 块。
+#
+# 末尾还有一个 Triton kernel：把 (block_table, positions) 算成 slot_mapping，
+#   顺带处理 CP（context parallel）下的“本机只存一部分 KV”的错位映射。
+
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -26,6 +43,11 @@ from vllm.v1.utils import CpuGpuBuffer
 logger = init_logger(__name__)
 
 
+# [CN] 计算块表**宽度**（每行多少个 kernel 块）。
+#      两个处理：
+#        1) 按 token_alignment（默认 128）向上取整 —— 
+#           让每行长度对齐，便于 kernel 向量化与 CUDA graph 复用；
+#        2) 从“管理块数”换算成“kernel 块数”（乘 block_size / kernel_block_size）。
 def get_block_table_width(
     max_num_blocks: int,
     block_size: int,
@@ -49,11 +71,19 @@ def get_block_table_width(
     return max_num_blocks * block_size // kernel_block_size
 
 
+# [CN] slot mapping 模式：
+#   TOKEN_TO_KV_SLOT —— 普通注意力：每个 token 对应一个 KV 槽位，需要映射；
+#   NONE             —— Mamba 类状态缓存：块表直接当“状态下标”用，
+#                      不需要逐 token 映射（也就不需要 slot_mapping 缓冲）。
 class SlotMappingMode(Enum):
     TOKEN_TO_KV_SLOT = "token_to_kv_slot"
     NONE = "none"
 
 
+# [CN] 单个 KV cache group 的块表。核心是三块缓冲：
+#   block_table  —— CPU/GPU 双份（CpuGpuBuffer），CPU 上填、一次性拷到 GPU；
+#   slot_mapping —— 本步每个 token 的目标槽位；
+#   num_blocks_per_row —— 每行当前有效长度。
 class BlockTable:
     def __init__(
         self,
@@ -88,6 +118,12 @@ class BlockTable:
         self.device = device
         self.kv_cache_block_size = block_size
 
+        # [CN] 两种情形：
+        #   kernel 块 == 管理块 —— 一一对应，最简单；
+        #   kernel 块 <  管理块 —— 需要做“块拆分”（hybrid）：
+        #     一个管理块摊成 blocks_per_kv_block 个 kernel 块。
+        #     为什么要拆：分配时希望块大一点（减少块表长度、便于复用），
+        #     但 kernel 只认小一点的块（算子实现/性能要求）。
         if kernel_block_size == block_size:
             # Standard case: allocation and computation use same block size
             # No block splitting needed, direct mapping
@@ -127,6 +163,10 @@ class BlockTable:
         else:
             self._kernel_block_arange = None
 
+        # [CN] 取 PCP / DCP 的 world size 与 rank。
+        #      CP 下“本机只保存一部分 KV”，所以 slot 映射要按 rank 过滤：
+        #      不属于本 rank 的位置填 PAD_SLOT_ID（见下面的 kernel）。
+        #      测试环境里通信组可能没初始化，所以用 try/except 兜底为 1/0。
         try:
             self.pcp_world_size = get_pcp_group().world_size
             self.pcp_rank = get_pcp_group().rank_in_group
@@ -154,6 +194,9 @@ class BlockTable:
                 block_size=self.block_size,
             )
 
+    # [CN] 在指定行**追加**块 id（请求继续生成、拿到新块时用）。
+    #      注意只在 CPU 侧 numpy 缓冲上写，真正上传到 GPU 要等
+    #      commit_block_table()。这样一次 step 只做一次 H2D 拷贝。
     def append_row(
         self,
         block_ids: list[int],
@@ -172,16 +215,23 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
 
+    # [CN] 重设某一行（请求重新调度 / 块表重建时用）：先把长度清零再 append。
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
+    # [CN] 清空某一行：把用过的部分填 0（0 号块是保留的 null 块）。
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
 
+    # [CN] 把 src 行搬到 tgt 行（请求在批次里换位置时用）。
+    #      **同时清空 src 行** —— 这个细节很重要：
+    #      dummy batch / mamba 状态槽可能还会引用旧行并**原地写状态**，
+    #      而这些块可能已经被释放并重新分配给别人了。
+    #      不清零就会踩到别人的块（非常难查的串数据 bug）。
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
@@ -193,11 +243,14 @@ class BlockTable:
         block_table_np[src, :num_blocks] = 0
         self.num_blocks_per_row[src] = 0
 
+    # [CN] 交换两行（调度器做请求排序时常用，比 move 更省一次拷贝）。
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
 
+    # [CN] 计算本步的 slot_mapping：把 (block_table, positions) 交给 Triton kernel。
+    #      Mamba 类（NONE 模式）直接返回 —— 它们不用逐 token 槽位。
     def compute_slot_mapping(
         self,
         num_reqs: int,
@@ -228,6 +281,7 @@ class BlockTable:
             self.cp_kv_cache_interleave_size,
         )
 
+    # [CN] 把 CPU 侧填好的块表前 num_reqs 行一次性拷到 GPU。
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
 
@@ -235,6 +289,8 @@ class BlockTable:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
 
+    # [CN] 管理块 id -> kernel 块 id 的换算：
+    #      管理块 b 展开为 [b*N, b*N+1, ..., b*N+N-1]，N = blocks_per_kv_block。
     @staticmethod
     def map_to_kernel_blocks(
         kv_manager_block_ids: np.ndarray,
@@ -285,6 +341,9 @@ class BlockTable:
         )
 
 
+# [CN] 多 KV cache group 的块表集合（混合注意力模型每个 group 一张表）。
+#      它本身只是“对每张表做同样的事”的转发层，
+#      但构造时要为每个 group 单独算块表宽度（块大小可能不同）。
 class MultiGroupBlockTable:
     """The BlockTables for each KV cache group."""
 
@@ -319,6 +378,9 @@ class MultiGroupBlockTable:
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
+        # [CN] 按 group 分别计算块表宽度。
+        #      NONE 模式（Mamba）不做 token_alignment 对齐：
+        #      它把块表当状态下标用，对齐反而会打乱下标语义。
         max_num_blocks = [
             (
                 get_block_table_width(n, block_size, token_alignment=None)
@@ -394,6 +456,22 @@ class MultiGroupBlockTable:
         return self.block_tables[idx]
 
 
+# [CN] 计算 slot_mapping 的 Triton kernel。
+#      输入：query_start_loc（每个请求的 token 区间）、positions（每个 token 的位置）
+#            block_table（请求的块序列）；
+#      输出：slot_mapping（每个 token 写到哪个 KV 槽位）。
+#
+#      核心公式：slot_id = block_table[req][pos // block_size] * block_size
+#                         + pos % block_size
+#
+#      CP 下的额外处理：一个“虚拟块”（virtual_block_size = 管理块 * CP world size）
+#      的 KV 被切到多个 rank 上，按 interleave 交错存放。
+#      所以要先判断这个位置**是否属于本 rank**（is_local），
+#      不属于就填 PAD_SLOT_ID（kernel 会跳过它）。
+#
+#      另外注意第一个 program（req_idx == num_reqs）专门负责：
+#      把 slot_mapping 尾部**补满 PAD_ID** —— CUDA graph 要求张量形状固定，
+#      不能因为本步 token 少就留着脏数据。
 class ComputeSlotMappingKernel(
     VllmTritonJitKernel["ComputeSlotMappingKernel.CompileKey"]
 ):
@@ -444,6 +522,8 @@ class ComputeSlotMappingKernel(
         start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
         end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
 
+        # [CN] 虚拟块大小：CP 把一个管理块的 KV 切到 world_size 个 rank 上，
+        #      所以从“位置”角度看，一个虚拟块覆盖 world_size 倍 token。
         virtual_block_size = KV_CACHE_BLOCK_SIZE * TOTAL_CP_WORLD_SIZE
         row_offset = req_idx * block_table_stride
         for i in range(start_idx, end_idx, BLOCK_SIZE):
@@ -452,6 +532,9 @@ class ComputeSlotMappingKernel(
             pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
             virtual_block_indices = pos // virtual_block_size
             virtual_block_offsets = pos - virtual_block_indices * virtual_block_size
+            # [CN] 判断这个位置是否属于本 rank：
+            #      按 interleave 粒度交错切分，(offset / interleave) % world_size
+            #      等于本 rank 才是本地数据。
             is_local = (
                 virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
             ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
@@ -476,6 +559,10 @@ class ComputeSlotMappingKernel(
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
             tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
+    # [CN] dispatch：把运行期参数转成编译期常量（constexpr），
+    #      让 Triton 能为每种形状组合编译一份特化 kernel。
+    #      block_table_stride / block_size 用 triton_scalar_specialization_rep
+    #      归拢到少数几个档位，避免组合爆炸。
     def dispatch(  # type: ignore[override]
         self,
         *,
@@ -515,6 +602,8 @@ class ComputeSlotMappingKernel(
             cp_kv_cache_interleave_size=compile_key.cp_kv_cache_interleave_size,
         )
 
+    # [CN] 启动配置：grid = num_reqs + 1 —— 多出来的那一个 program
+    #      专门负责给 slot_mapping 尾部填充 PAD_ID（CUDA graph 需要定长）。
     @kernel_launcher
     def __call__(
         self,

@@ -7,6 +7,9 @@ from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.request import Request, RequestStatus
 
 
+# [CN] 判断序列**尾部**是否出现了长度为 pattern_len 的重复模式。
+#      做法：拿最后 pattern_len 个 token，跟前面 (min_count-1) 段比对，
+#      每一段的对应位置都必须相同。
 def _has_repeating_pattern(
     token_ids: Sequence[int],
     pattern_len: int,
@@ -25,6 +28,10 @@ def _has_repeating_pattern(
     return True
 
 
+# [CN] 重复（幻觉）检测：从 min_pattern_size 到 max_pattern_size 逐个试，
+#      只要有一种周期命中就判定为重复 -> 结束请求。
+#      注意 pattern_len * min_count > len(token_ids) 时直接返回 False：
+#      序列还不够长，不可能出现这么长的重复。
 def check_sequence_repetition(
     token_ids: Sequence[int],
     params: RepetitionDetectionParams,
@@ -59,6 +66,11 @@ def check_sequence_repetition(
     return False
 
 
+# [CN] 从 list 里删元素。**删单个时用原地 remove（快路径）**，
+#      删多个时才用列表推导重建。
+#      注意返回值语义不一致：单个时返回**原 list（已原地修改）**，
+#      多个时返回**新 list** —— 所以调用方必须用返回值，
+#      不能假设是原地修改。这是 Python 里很容易踩的坑。
 def remove_all(lst: list, items_to_remove: set) -> list:
     """Remove all items from a list that are in the items_to_remove set.
 
@@ -91,6 +103,12 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
+# [CN] 判断请求是否该停。判定顺序**不能随便改**（注释里列了三个 PR）：
+#        1) eos / stop_token_ids —— 模型自己说要停，优先级最高；
+#        2) 长度上限（max_model_len / max_tokens）；
+#        3) **min_tokens 检查放在长度之后、重复检测之前** ——
+#           还没到 min_tokens 就直接返回 False（不检查重复），
+#           否则模型刚开头就被判重复而终止，min_tokens 形同虚设。
 def check_stop(request: Request, max_model_len: int) -> bool:
     assert not request.pooling_params
 

@@ -1305,6 +1305,17 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
+    # [CN] 启动握手的总入口。为什么需要"握手"？
+    #      引擎进程是被 fork/spawn 出来的，它不知道前端的 ZMQ 地址；
+    #      反过来前端也不知道这个引擎的身份（identity）。握手就是交换这些信息，
+    #      顺便把 DP 协调器地址、需要覆盖的并行配置一起传过来。
+    #      三种场景：
+    #        DP=1 / 离线      ：只跟同机前端握一次；
+    #        DP>1 内部 LB     ：跟共享前端（可能在别的节点）握一次；
+    #        DP>1 外部/混合 LB：握两次 —— 先跟 rank0 前端拿 DP 协调器地址，
+    #                           再跟本机前端拿 input/output socket 地址。
+    #      注意最后那句 vllm_config.__post_init__()：握手可能改了并行配置，
+    #      必须重新跑一遍后处理，让各处派生字段保持一致。
     @contextmanager
     def _perform_handshakes(
         self,
@@ -1370,6 +1381,12 @@ class EngineCoreProc(EngineCore):
         # Update config which may have changed from the handshake
         vllm_config.__post_init__()
 
+    # [CN] 单次握手，实现为一个 contextmanager：
+    #        __enter__：连上前端 -> 发 HELLO -> 收到 init 消息（含地址）
+    #        __exit__ ：引擎初始化完成后，发 READY 告诉前端"我起来了"
+    #      用 with 块界定"初始化耗时区间"，比手写 try/finally 更不容易漏。
+    #      DP>1 时 READY 还会带上 parallel_config_hash，
+    #      让前端能校验所有 rank 的配置是否一致（配置漂移是很常见的事故）。
     @contextmanager
     def _perform_handshake(
         self,
@@ -1409,6 +1426,13 @@ class EngineCoreProc(EngineCore):
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
+    # [CN] 握手的两条消息：
+    #        HELLO（我来了，附 local / headless 标记）
+    #        -> 前端回 init 消息（ZMQ 地址 + 需要覆盖的 parallel_config 字段）
+    #      local    = 前端跟我在同一台机器；
+    #      headless = 我这个引擎没有同机前端（外部 LB 场景）。
+    #      init 消息里的 parallel_config 会被 setattr **就地覆盖** 到本进程，
+    #      这是前端向引擎下发权威配置的唯一通道（引擎侧不该自己猜）。
     @staticmethod
     def startup_handshake(
         handshake_socket: zmq.Socket,
@@ -1447,6 +1471,13 @@ class EngineCoreProc(EngineCore):
 
         return init_message.addresses
 
+    # [CN] 引擎进程的 main 函数（子进程 / Ray actor 的入口）。抓住三件事：
+    #      1) 进程身份：改进程名、起 tracer、日志加前缀、NUMA 亲和性；
+    #      2) 选 EngineCore 类型 —— 只有 **MoE + DP** 才用 DPEngineCoreProc。
+    #         原因：MoE 的 EP 需要 all-to-all，所有 rank 必须步调一致地跑前向；
+    #         非 MoE 的 DP rank 互不相干，直接退化成 DP=1 处理
+    #         （reconfigure_for_independent_dp_rank）。
+    #      3) 优雅退出：SIGTERM/SIGINT -> shutdown_state=REQUESTED -> 唤醒忙循环。
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
@@ -1497,6 +1528,10 @@ class EngineCoreProc(EngineCore):
 
             assert engine_core is not None
 
+            # [CN] 上面那段英文注释 "Not safe in a signal handler" 是重点：
+            #      信号处理函数可能在主线程正持有 input_queue.mutex 时打断它，
+            #      而 queue 的 mutex 不可重入 —— 直接在 handler 里 put 会死锁。
+            #      所以 handler 只置标志位，真正 put 交给 SignalCallback 在安全时机做。
             def wakeup_engine():
                 # Wakes up idle engine via input_queue when shutdown is requested
                 # Not safe in a signal handler - we may interrupt the main thread
@@ -1519,6 +1554,10 @@ class EngineCoreProc(EngineCore):
 
             engine_core.run_busy_loop()
 
+        # [CN] clean_shutdown 的判定条件很讲究：必须是「正常 SystemExit(code=0)
+        #      + 已推进到 SHUTTING_DOWN + 没有残留请求 + 用户没设关闭超时」四条全中，
+        #      才算干净退出 —— 此时可以在 ROCm 上 gc.freeze() 跳过一次昂贵的
+        #      循环 GC 扫描（进程马上要退了，内存由 OS 回收即可）。
         except SystemExit as e:
             logger.info_once("[shutdown] EngineCore: exiting busy loop")
             clean_shutdown = (
@@ -1552,9 +1591,18 @@ class EngineCoreProc(EngineCore):
                     # scan during finalization; process exit reclaims it.
                     gc.freeze()
 
+    # [CN] 钩子方法：基类与 DP 无关，什么都不做；DPEngineCoreProc 在这里建进程组。
+    #      用空钩子而不是在 __init__ 里写 if 分支，是为了让基类保持纯净、
+    #      也避免子类重复跑一遍基类已经做过的初始化顺序。
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
+    # [CN] "有没有活干" = 以下任一成立：
+    #        1) engines_running 为真（DP 下别的 rank 还有活，我必须陪跑）
+    #        2) 调度器自己还有请求（未完成 / 已完成但还没从 batch 摘掉）
+    #        3) batch_queue 里还有排队的批次（流水线并行 PP）
+    #      第 1 条是 DP 专用的：即使本地一个请求都没有，只要同波次其他 rank
+    #      还没跑完，我也得继续 step —— 否则集合通信对端会一直等（死锁）。
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
         return (
@@ -1567,6 +1615,13 @@ class EngineCoreProc(EngineCore):
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
+    # [CN] 引擎进程的心脏。每轮三步：
+    #        1) _process_input_queue：把 IO 线程塞进队列的请求取出来处理，
+    #           没活时**阻塞**等待（不空转烧 CPU）；
+    #        2) _process_engine_step：真正跑一次 step（调度 + 执行 + 出输出）；
+    #        3) 前后各发布一次请求计数（DP 负载均衡需要新鲜数据）。
+    #      @fault_tolerant_wrapper 让这里的异常被容错机制接管
+    #      （上报/降级）而不是让进程直接崩掉。
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
@@ -1594,6 +1649,14 @@ class EngineCoreProc(EngineCore):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    # [CN] 两个容易忽略的细节：
+    #      1) 这里用 **阻塞 get**（process_input_queue_block=True），空闲时线程
+    #         睡在队列上而不是忙轮询 —— 引擎空闲时 CPU 占用为 0。
+    #         （弹性扩缩容期间会把 block 临时关掉，好让状态机能推进。）
+    #      2) 空闲时用 aborts_queue.mutex 直接清空 abort 队列：因为 abort 请求
+    #         会**同时**进 aborts_queue 和 input_queue（前者抢先处理、后者保序），
+    #         空闲时没必要积压，直接清掉即可（scheduler 里 abort 是幂等的）。
+    #      最后那个非阻塞 while：把本轮剩余请求一次取干净，摊薄唤醒开销。
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
@@ -1625,6 +1688,10 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+    # [CN] 末尾那个 time.sleep(0.001) 看着无害，其实是防活锁的关键：
+    #      本轮没跑模型（例如请求都在 WAITING_FOR_REMOTE_KVS 等远端 KV），
+    #      但调度器还有活 —— 此时必须**主动让出 GIL**，
+    #      否则本线程一直空转，后台做 KV 传输的线程拿不到 GIL，进度永远推不动。
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
@@ -1649,6 +1716,11 @@ class EngineCoreProc(EngineCore):
             callback = self._idle_state_callbacks.pop()
             callback(self)
 
+    # [CN] 关闭是一个状态机：RUNNING -> REQUESTED -> SHUTTING_DOWN -> 退出。
+    #      shutdown_timeout == 0  => abort 模式：立刻把在途请求全部置为
+    #                               FINISHED_ABORTED，并给客户端发终止输出；
+    #      shutdown_timeout  > 0  => drain 模式：让在途请求跑完（有超时上限）。
+    #      每轮进来都先看 has_work()：没活了才返回 False 结束忙循环。
     def _handle_shutdown(self) -> bool:
         # Check if shutdown was requested and handle it
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1697,6 +1769,11 @@ class EngineCoreProc(EngineCore):
 
         return True
 
+    # [CN] 请求分发。UTILITY 分支里 lambda + getattr 的写法值得注意：
+    #      它把"查找方法"**延迟**到 lambda 被调用时才做，这样即使方法不存在
+    #      或者执行时抛异常，也能被 _invoke_utility_method 捕获并转成
+    #      failure_message 返回客户端，而不是让整个引擎进程崩掉。
+    #      设计原则：控制类 RPC 永远不应该打死引擎。
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
@@ -1759,6 +1836,10 @@ class EngineCoreProc(EngineCore):
         )
         return True
 
+    # [CN] 支持"返回 Future 的 utility"：不在这里阻塞等，而是挂一个
+    #      add_done_callback，等 future 完成后递归调用自己把结果发出去。
+    #      这样慢 utility（例如要广播到所有 worker 的 collective_rpc）
+    #      不会把引擎忙循环卡住。
     @staticmethod
     def _invoke_utility_method(
         name: str, get_result: Callable, output: UtilityOutput, enqueue_output: Callable
@@ -1778,6 +1859,10 @@ class EngineCoreProc(EngineCore):
             output.failure_message = f"Call to {name} method failed: {str(e)}"
         enqueue_output(output)
 
+    # [CN] 跨进程之后类型是丢的：msgpack 解出来是 dict / list，
+    #      但 utility 方法的签名要的是 msgspec.Struct。这里按**方法签名**
+    #      逐个把参数 convert 回目标类型。
+    #      为什么不直接信任客户端？因为客户端版本可能不同、编码路径也可能不同。
     @staticmethod
     def _convert_msgspec_args(method, args):
         """If a provided arg type doesn't match corresponding target method
@@ -1795,6 +1880,10 @@ class EngineCoreProc(EngineCore):
             for v, p in zip(args, arg_types)
         )
 
+    # [CN] 引擎要死了，必须先通知客户端（否则前端会一直等输出直到超时）。
+    #      注意 join(timeout=5.0)：ENGINE_CORE_DEAD 是由**输出线程**发出的，
+    #      这里要等它真的发出去再往下走，否则消息会随 socket 关闭一起丢失。
+    #      这正是 process_output_sockets 里 linger 设成 4000 的原因。
     def _send_engine_dead(self):
         """Send EngineDead status to the EngineCoreClient."""
 
@@ -1809,6 +1898,14 @@ class EngineCoreProc(EngineCore):
                 "to send. Please report this issue."
             )
 
+    # [CN] 这是"引擎初始化完成后，前端需要知道的全部事实"。
+    #      为什么必须回传 —— 很多值只有引擎侧才算得准：
+    #        num_gpu_blocks / kv_cache_size_tokens：显存实测出来的
+    #        max_model_len                ：auto-fit 可能被改小
+    #        block_size / mamba_block_size：平台相关
+    #        dtype                        ：可能被 auto / 量化改写
+    #        supports_draft_weight_updates：要问执行器才知道
+    #      前端拿到后写回自己的 VllmConfig（见 core_client._apply_ready_response）。
     def _make_ready_response(self) -> EngineCoreReadyResponse:
         parallel_config = self.vllm_config.parallel_config
         scheduler_config = self.vllm_config.scheduler_config
@@ -1851,6 +1948,14 @@ class EngineCoreProc(EngineCore):
             ),
         )
 
+    # [CN] **输入 IO 线程**：与忙循环分离，所以引擎在算的时候也能收新请求。
+    #      两处容易忽略的设计：
+    #      1) 每个 input socket 起来后要先发一帧 READY（内容就是 ready_response）——
+    #         ZMQ 的 DEALER/ROUTER 必须由 DEALER 先说话，ROUTER 才知道往哪回；
+    #         于是"握手回传配置"和"打通 socket"这两件事被合并成了一次发送。
+    #      2) abort 请求会**同时**进 aborts_queue 和 input_queue：
+    #         前者让忙循环能抢先处理，后者保证顺序不漏；之所以安全，
+    #         是因为 scheduler 里 abort 是幂等的（重复 abort 同一 id 无害）。
     def process_input_sockets(
         self,
         input_addresses: list[str],
@@ -1954,6 +2059,12 @@ class EngineCoreProc(EngineCore):
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 
+    # [CN] **输出 IO 线程**，里面有一套手写的**缓冲区复用**：
+    #      encode_into 直接把 msgpack 写进复用的 bytearray，再零拷贝发出去。
+    #      为什么不用 send_multipart？因为它只返回**最后一帧**的 tracker，
+    #      而我们需要第一帧的 tracker 来判断"整条消息发完了没" ——
+    #      只有它 done 了，缓冲区才允许回收复用（见 _send_msg_tracking_payload）。
+    #      client_index == -1 是给 DP 协调器的控制通道，包很小，不参与复用。
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
     ):
@@ -2023,6 +2134,11 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
+    # [CN] 多模态 sender cache 的 P0/P1 **缓存漂移**自愈路径：
+    #      前端缓存里有这个 mm item，但引擎侧没有（或 hash 变了），
+    #      于是返回可重试的错误响应并附上漂移的 hash，让前端把这些条目
+    #      从缓存里删掉、下次带完整数据重发。
+    #      用 warning 而不是 exception：这属于预期内、可自愈的流程。
     def _handle_mm_cache_miss(
         self, request: EngineCoreRequest, err: MultiModalCacheMissError
     ) -> None:
@@ -2057,6 +2173,10 @@ class EngineCoreProc(EngineCore):
             )
         )
 
+    # [CN] 手写发送的缘由（docstring 里那句话的展开）：
+    #      zmq 的 send_multipart 只返回最后一帧的 MessageTracker，
+    #      而我们靠第一帧的 tracker 判断整条消息是否已发完 —— 只有发完了
+    #      才能把 bytearray 拿回去复用，否则会踩到"改了还在发送中的缓冲"。
     @staticmethod
     def _send_msg_tracking_payload(
         socket: zmq.Socket, buffers: Sequence[bytestr]
@@ -2083,6 +2203,13 @@ class EngineCoreProc(EngineCore):
         )
         self._send_error_outputs_to_client([request.request_id], request.client_index)
 
+    # [CN] 三种暂停语义的区别：
+    #        abort：立刻终止在途请求（sleep / 权重更新前的快速清空）
+    #        wait ：不终止，让在途的跑完（优雅排空）
+    #        keep ：冻结在途请求，resume 后接着跑（RL 权重更新常用）
+    #      返回 Future 而不是阻塞：因为"引擎真的空下来"这件事
+    #      只能在忙循环里通过 _idle_state_callbacks 观察到，
+    #      从调用方线程是判断不了的。
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> Future | None:
@@ -2123,6 +2250,9 @@ class EngineCoreProc(EngineCore):
         self._idle_state_callbacks.append(partial(engine_idle_callback, future=future))
         return future
 
+    # [CN] 基类语义：只要自己没活就算暂停完成。
+    #      DP 子类**必须**返回 False —— 只停自己没用，必须 all-reduce 让所有
+    #      rank 一起停，否则别的 rank 还在做集合通信，会把自己一起拖死。
     def _pause_complete(self) -> bool:
         """Returns True if the pause has fully completed and the caller can
         return ``None`` synchronously; False if the pause is still pending
@@ -2150,6 +2280,8 @@ class EngineCoreProc(EngineCore):
     ) -> None:
         self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ERROR)
 
+    # [CN] 按 client_index 分组发送：前端 scale-out 部署时，多个前端连着同一个
+    #      引擎，abort 输出必须回到**当初提交请求的那个前端**，不能广播。
     def _send_abort_outputs(self, aborted_reqs: list[Request]) -> None:
         # TODO(nick) this will be moved inside the scheduler
         if aborted_reqs:
@@ -2165,6 +2297,14 @@ class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
     in a data parallel context."""
 
+    # [CN] DP 版引擎进程，**只在 MoE + DP 时使用**（见 run_engine_core 的分支）。
+    #      MoE 特殊在哪：EP 的 all-to-all 要求所有 rank 步调完全一致地跑前向；
+    #      而非 MoE 的 DP rank 各跑各的，不需要任何跨 rank 同步。
+    #      本类在基类之上新增的四个机制：
+    #        - 波次（wave）：current_wave，一批请求 = 一波，齐步走；
+    #        - dummy batch：本地没活但全局有活时，跑空批次陪跑；
+    #        - all-reduce 共识：每 dp_sync_interval 步同步一次"是否还有活"；
+    #        - 两阶段暂停：pending_pause + ignore_start_dp_wave。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2183,6 +2323,9 @@ class DPEngineCoreProc(EngineCoreProc):
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
         self.dp_sync_interval = vllm_config.parallel_config.dp_sync_interval
 
+        # [CN] step_counter 存在的意义：它在所有 DP rank 上是**同步递增**的，
+        #      于是可以做"cadence 对齐" —— 例如每隔 N 步才允许调度新的 prefill，
+        #      让各 rank 的 prefill 尽量同时开始（见 _should_throttle_prefills）。
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
         self.step_counter = 0
@@ -2196,6 +2339,9 @@ class DPEngineCoreProc(EngineCoreProc):
         self.pending_pause = False
         self.ignore_start_dp_wave = False
 
+        # [CN] 弹性 EP（Elastic Expert Parallel）扩缩容状态机；None 表示当前没有
+        #      正在进行的扩缩容。它由 run_busy_loop 每轮调用 state.progress() 推进，
+        #      属于协作式（而不是抢占式）的伸缩。
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
@@ -2213,6 +2359,10 @@ class DPEngineCoreProc(EngineCoreProc):
             tensor_queue=tensor_queue,
         )
 
+    # [CN] 建立 **stateless** DP 进程组：之所以叫 stateless，是因为它用外部
+    #      创建好的 store，而不是跑在某个 rank 上的 TCPStore 服务器。
+    #      好处：整组可以随意销毁重建，不依赖任何固定进程存活 ——
+    #      这正是弹性扩缩容能成立的前提。
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
         parallel_config = vllm_config.parallel_config
@@ -2229,11 +2379,17 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
+    # [CN] 必须显式销毁 DP 进程组：否则 stateless store 的端口与资源不会释放，
+    #      下次以相同规模重启时会撞端口。
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
+    # [CN] 注意这里**恒返回 False**：DP 下不能"自己停了就算完"，必须走
+    #      all-reduce 让所有 rank 一起停（见 _has_global_unfinished_reqs）。
+    #      把 engines_running 置为 True 是为了**唤醒**空转的引擎进入步进循环 ——
+    #      不然它正睡在 input_queue 上，永远走不到那个 all-reduce 汇合点。
     def _pause_complete(self) -> bool:
         """Two-phase DP-aware pause.
 
@@ -2252,6 +2408,11 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return False
 
+    # [CN] 波次追赶，处理一个经典竞态：
+    #      本 rank 空闲后已经把 current_wave +1，此时客户端（还没收到
+    #      wave_complete 通知）又发来一个**旧波次**的请求。
+    #      不处理的话这个请求会被晾到下一波才跑 —— 所以这里主动发
+    #      start_wave 通知前端"我需要开新的一波"。
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
         if self.has_coordinator and request_wave != self.current_wave:
@@ -2268,6 +2429,12 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
+    # [CN] 两个防御都很关键：
+    #      1) 上一轮暂停还没走完（pending_pause 未清）就 resume —— 直接报错。
+    #         因为 ignore_start_dp_wave 还没复位，状态会打架。
+    #      2) resume 之后必须做一次 **barrier**：用一次 all-reduce 确认所有 rank
+    #         都完成了 resume。否则先 resume 的 rank 开始 all-to-all 时，
+    #         还没 resume 的 rank 根本没在等它 —— 经典死锁。
     def resume_scheduler(self):
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
@@ -2293,12 +2460,20 @@ class DPEngineCoreProc(EngineCoreProc):
         if has_global_unfinished:
             self.engines_running = True
 
+    # [CN] 仅测试用的显式屏障。真实路径里不做单独 barrier：
+    #      同步是搭 _has_global_unfinished_reqs 的 all-reduce 顺风车完成的，
+    #      省一次通信（每步都要做，能省则省）。
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
         import torch.distributed as dist
 
         dist.barrier(group=self.dp_group)
 
+    # [CN] START_DP_WAVE 是协调器广播的"开新一波"信号。
+    #      exclude_eng_index 的作用：发起方自己不需要再被通知一次
+    #      （它本来就已经在跑了）。
+    #      ignore_start_dp_wave 是两阶段暂停的尾巴：暂停期间到达的陈旧
+    #      START_DP_WAVE 必须丢弃，否则会把刚停下的引擎又唤醒。
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
@@ -2319,6 +2494,9 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             super()._handle_client_request(request_type, request)
 
+    # [CN] DP 版比基类多带 step_counter 与 current_wave：
+    #      让前端的负载均衡器知道这份统计是"第几波、第几步"的快照，
+    #      否则可能拿上一波的数据给当前这一波做路由决策。
     def _maybe_publish_request_counts(self):
         if not self.publish_dp_lb_stats:
             return
@@ -2336,6 +2514,10 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    # [CN] prefill 节流：只在 cadence 对齐的步上允许调度新的 prefill。
+    #      目的：让各 DP rank 的 prefill **同时开始**，避免某个 rank 单独扛下
+    #      一波长 prompt 而成为短板（DP 齐步走，最慢者决定整波耗时）。
+    #      step_counter 在新波次从 0 开始，所以空闲之后能立刻响应，不节流。
     def _should_throttle_prefills(self) -> bool:
         # Throttle new prefills to cadence-aligned steps for DP balancing.
         # step_counter is identical across DP ranks. On a fresh wave the
@@ -2345,6 +2527,13 @@ class DPEngineCoreProc(EngineCoreProc):
             and self.step_counter % self.prefill_schedule_interval != 0
         )
 
+    # [CN] DP 忙循环与基类版本的差异，逐条对照：
+    #      1) **弹性 EP 驱动**：每轮推进一次 eep_scaling_state 状态机；
+    #      2) **dummy batch**：本轮没真正跑前向但全局还有活时，跑一个空批次；
+    #      3) **全局 all-reduce**：engines_running = 全局是否还有活；
+    #      4) **波次收尾**：全局都没活时 current_wave += 1、step_counter 归零，
+    #         并由 rank0（有协调器时发给协调器）广播 wave_complete。
+    #      dummy batch 是 DP 最容易踩坑、也最能体现"齐步走"约束的地方。
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -2378,6 +2567,10 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
+                # [CN] 三种情况都会"本轮没跑前向"：本地真的没请求 / 请求都在等远端 KV /
+                #      被 pause 冻结了。但只要全局还有活（别的 rank 在跑），就必须跑
+                #      dummy batch 陪跑，否则对端会一直等 -> 死锁。
+                #      唯一例外是 model_executor.is_sleeping（睡眠模式下不该跑）。
                 # Execute a dummy pass when no ready requests ran, unless the
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
@@ -2389,6 +2582,8 @@ class DPEngineCoreProc(EngineCoreProc):
                             (0, EngineCoreOutputs(scheduler_stats=stats))
                         )
 
+            # [CN] 用 all-reduce 把"本地是否还有活"升级成"全局是否还有活"，
+            #      结果直接决定下一轮是否继续步进。这是 DP 齐步走的判决点。
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
@@ -2429,6 +2624,13 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
+    # [CN] DP 同步的心脏。两个要点：
+    #      1) 不是每步都做 all-reduce（通信太贵），而是每 dp_sync_interval 步一次；
+    #         但**第 1 步必须同步**（step_counter != 1 的短路条件）——
+    #         否则空闲暂停时要等满一整个 interval 才能停下，退出会明显变慢。
+    #      2) 一次 all-reduce 顺带干两件事：同步"是否还有活" + 同步"是否所有
+    #         rank 都想暂停"（pause_consensus）。把两次通信合并成一次，
+    #         是分布式里很常见的优化手法。
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
@@ -2448,6 +2650,12 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return has_unfinished
 
+    # [CN] 弹性 EP 的入口。注意它**不立即执行**扩缩容，而是构造一个
+    #      ElasticEPScalingState 状态机挂到引擎上，由忙循环每轮 state.progress()
+    #      推进 —— 协作式的好处是不会在通信进行到一半时被强行打断。
+    #      返回的 ready_key 给客户端用于等待"新引擎就绪"。
+    #      process_input_queue_block = False：伸缩期间输入队列不要阻塞等待，
+    #      否则会卡在等新请求上，状态机反而推进不了。
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
     ) -> str:
@@ -2502,6 +2710,8 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         return state.ready_key
 
+    # [CN] 两阶段提交的"提交"阶段：把 commit_requested 置真，
+    #      真正的切换由忙循环里的状态机在安全点完成。
     def commit_prepared_elastic_ep(self) -> None:
         state = self.eep_scaling_state
         if state is None or state.commit_requested or not state.is_ready_for_switch():
@@ -2510,6 +2720,9 @@ class DPEngineCoreProc(EngineCoreProc):
         self.process_input_queue_block = False
         logger.info("[Elastic EP] Committing prepared reconfiguration")
 
+    # [CN] 复用 **UTILITY 通道** 发通知（call_id 用特殊的 EEP_NOTIFICATION_CALL_ID），
+    #      而不是新开一条 socket —— 省掉一整套连接管理。
+    #      兜底分支：输出线程还没起来时（扩缩容很早期），临时建 socket 发一次。
     def _eep_send_engine_core_notification(
         self, notification_type: EEPNotificationType
     ):
@@ -2543,6 +2756,9 @@ class DPEngineCoreProc(EngineCoreProc):
             ):
                 socket.send_multipart(encoder.encode(outputs))
 
+    # [CN] "新加入的 rank"走的另一条路：它必须在 KV cache 初始化**之前**
+    #      就建好通信域，因为 profile / 初始化阶段本身就需要集合通信。
+    #      ignore_start_dp_wave = True：刚起来时不能响应旧波次的唤醒信号。
     def _eep_scale_up_before_kv_init(self):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
@@ -2568,6 +2784,10 @@ class EngineCoreActorMixin:
     Ray actor for running EngineCore in a data parallel context
     """
 
+    # [CN] Ray actor 版引擎的混入类：把"进程版靠 fork 继承的东西"
+    #      （可见设备、地址、tracer）改成在 actor __init__ 里显式设置。
+    #      两个 final 类 DPMoEEngineCoreActor / EngineCoreActor 都是
+    #      「本 Mixin + 对应的 Proc 类」的多继承组合。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2588,6 +2808,11 @@ class EngineCoreActorMixin:
 
         self._set_nixl_side_channel_host()
 
+        # [CN] Ray 场景的坑（上面那段长英文注释的要点）：
+        #      Ray 会自己设置 CUDA_VISIBLE_DEVICES，而且它是 **sticky** 的 ——
+        #      后续创建的子进程会继承、并且是"按序号索引"而不是按物理 GPU id。
+        #      所以 vLLM 必须在 actor 创建的最早期就把它改回物理 GPU id，
+        #      否则后面 worker 索引时会越界。
         # Set CUDA_VISIBLE_DEVICES as early as possible in actor life cycle
         # NOTE: in MP we set CUDA_VISIBLE_DEVICES at process creation time,
         # and this cannot be done in the same way for Ray because:
@@ -2607,6 +2832,9 @@ class EngineCoreActorMixin:
         # of ray.
         self._set_visible_devices(vllm_config, local_dp_rank)
 
+    # [CN] NIXL 旁路通道的 host 必须在 actor 内部设置：
+    #      这类"驱动侧"的环境变量不会被 Ray 自动传播进 actor。
+    #      用 setdefault 是为了保留用户显式指定的值。
     @staticmethod
     def _set_nixl_side_channel_host():
         import ray
@@ -2628,6 +2856,9 @@ class EngineCoreActorMixin:
                 vllm_config, local_dp_rank, device_control_env_var
             )
 
+    # [CN] 按 local_dp_rank 切分物理 GPU：本 rank 用
+    #      [local_dp_rank * world_size, (local_dp_rank + 1) * world_size) 这一段。
+    #      结果写回 parallel_config，后续 worker 创建时直接用。
     def _set_assigned_physical_gpu_ids(
         self,
         vllm_config: VllmConfig,
@@ -2653,6 +2884,9 @@ class EngineCoreActorMixin:
                 f'base value: "{os.getenv(device_control_env_var)}"'
             ) from e
 
+    # [CN] Ray 版**不需要**握手：actor 是被显式创建出来的，
+    #      地址在构造时就作为参数传进来了，所以这里直接 yield。
+    #      这也是为什么 _perform_handshakes 要抽象成一个可覆盖的方法。
     @contextmanager
     def _perform_handshakes(
         self,
@@ -2669,6 +2903,9 @@ class EngineCoreActorMixin:
         """
         yield self.addresses
 
+    # [CN] 空方法，存在的意义是给调用方一个"可 ray.get() 的屏障"：
+    #      当 ray.get(actor.wait_for_init.remote()) 返回时，
+    #      Ray 保证 actor 的 __init__ 已经跑完。
     def wait_for_init(self):
         """
         Wait until the engine core is initialized.
@@ -2679,6 +2916,9 @@ class EngineCoreActorMixin:
         """
         pass
 
+    # [CN] actor 的入口方法。SystemExit 是正常退出信号（引擎忙循环结束时抛），
+    #      只 debug 不报错；其它异常记日志后继续抛，让 Ray 标记 actor 失败。
+    #      finally 里 shutdown() 保证资源回收。
     def run(self):
         """
         Run the engine core busy loop.
@@ -2698,6 +2938,9 @@ class EngineCoreActorMixin:
 class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
     """Used for MoE model data parallel cases."""
 
+    # [CN] MoE + DP 场景的 Ray actor：先由 Mixin 设好设备与地址，
+    #      再跑 DPEngineCoreProc 的完整初始化（handshake_address 传空串，
+    #      因为 Ray 下不走握手）。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2721,6 +2964,9 @@ class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
 class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):
     """Used for non-MoE and/or non-DP cases."""
 
+    # [CN] 非 MoE 或 DP=1 场景的 Ray actor。
+    #      注意 reconfigure_for_independent_dp_rank()：把这个 rank 当成
+    #      **独立的一张world**来初始化，不参与任何 DP 同步。
     def __init__(
         self,
         vllm_config: VllmConfig,

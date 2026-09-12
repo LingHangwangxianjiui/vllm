@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# [CN] 文件总览：EPLB = Expert Parallelism Load Balancing。
+# [CN] MoE 模型中各专家的负载会随输入漂移，EPLB 周期性重排
+# [CN] 「逻辑专家 -> 物理专家」的映射，让各 EP rank 负载均衡。
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
@@ -18,6 +22,9 @@ from vllm.model_executor.models.interfaces import (
 logger = init_logger(__name__)
 
 
+# [CN] 装饰器：在某个 runner 方法「成功返回后」推进一次 EPLB。
+# [CN] 放在方法之后而不是之前，是为了让重排基于本步真实的专家统计。
+# [CN] dummy run 也会走（is_dummy=True），否则各 DP rank 节奏不一致会挂死。
 def step_eplb_after(*, is_dummy: bool = False) -> Callable:
     """Step EPLB after a model runner method completes successfully."""
 
@@ -37,6 +44,8 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
     return decorator
 
 
+# [CN] 把「是否启用、是否已注册模型、是否被抑制」这些散落判断收拢到一处，
+# [CN] 让 runner 主链路只调 self.eplb.step() 即可。
 class EPLBController:
     def __init__(self, parallel_config: Any, device: torch.device):
         self.parallel_config = parallel_config
@@ -51,6 +60,8 @@ class EPLBController:
         if self.parallel_config.enable_eplb:
             self.state = EplbState(self.parallel_config, self.device)
 
+    # [CN] 草稿模型若也是 MoE，也要纳入 EPLB；
+    # [CN] 但 elastic EP 与草稿模型不兼容，这里直接断言拒绝。
     def maybe_register_speculator(
         self,
         speculator: Any | None,
@@ -106,6 +117,8 @@ class EPLBController:
         self._has_registered_models = True
         return True
 
+    # [CN] 异步模式下另起线程做重排决策，不阻塞前向。
+    # [CN] 只有真的注册了模型才需要启动。
     def maybe_start_async_loop(self, eplb_models_added: bool) -> None:
         if eplb_models_added and self.state is not None and self.state.is_async:
             self.state.start_async_loop()
@@ -139,6 +152,7 @@ class EPLBController:
             return
         self.state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
 
+    # [CN] 从外部给定的「物理->逻辑」映射直接重建（用于弹性 EP / 扩缩容）。
     def setup_from_mapping(
         self,
         model: nn.Module,

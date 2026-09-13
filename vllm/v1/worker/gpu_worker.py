@@ -1,5 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：GPU Worker —— 一个 worker 进程的「主控」。
+# [CN] 链路：Executor -> WorkerWrapperBase -> Worker(gpu_worker) -> GPUModelRunner。
+# [CN] 本文件的职责（都可被 collective_rpc 远程调用）：
+# [CN]   1) init_device：设备/分布式环境初始化、显存快照；
+# [CN]   2) determine_available_memory：profile 出「能给 KV cache 用多少显存」；
+# [CN]   3) initialize_from_config：按调度器算好的配置真正分配 KV cache；
+# [CN]   4) compile_or_warm_up_model：torch.compile + CUDA Graph 捕获；
+# [CN]   5) execute_model / sample_tokens：每步前向与采样。
+# [CN] 最容易看错的点：
+# [CN]   1) 显存测量的顺序极其讲究：必须先建分布式环境（NCCL 会占显存）
+# [CN]      再打快照，否则会把 NCCL buffer 算进 KV cache 预算，运行时 OOM；
+# [CN]   2) 存在 V1 / V2 两代 model runner，由 use_v2_model_runner 切换，
+# [CN]      当前默认仍是 V1（gpu_model_runner.py）；
+# [CN]   3) sleep/wake 用 CuMem 内存池做「整块归还再取回」，level=2 还要
+# [CN]      额外把 buffer 搬到 CPU 保存（因为权重内存会被真的释放）。
+
 """A GPU worker class."""
 
 import gc
@@ -102,6 +119,8 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+# [CN] 工作区 lane 数：只有 V2 runner + DSpark 投机解码时才需要 2 条
+# [CN] （target 与 draft 的 CUDA graph 会同时持有工作区视图）。
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -111,6 +130,9 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
     )
 
 
+# [CN] ROCm 上的显存画像兜底。
+# [CN] 测量的是「启动过程中空闲显存的下降量」，若期间别的进程释放了显存，
+# [CN] 这个值会变成负数；此时改用 torch 的 reserved 量作为下界，避免拒绝启动。
 def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:
     """Memory in bytes to size the KV cache from when profiling measured a
     release on ROCm, or None to keep what profiling measured.
@@ -120,6 +142,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
     reserved is process local, so it stands in as a lower bound instead of refusing
     to start. Kept to ROCm, where the AMD CI groups hit this, following #45490.
     """
+    # [CN] 只在 ROCm 上启用这个兜底（AMD CI 环境遇到过）。
     if profile_result.total_consumed >= 0 or not current_platform.is_rocm():
         return None
 
@@ -144,6 +167,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+# [CN] 带「惰性通信同步」的中间张量（PP 场景）。
+# [CN] 目的：PP 的 rank 可以先拿到张量句柄继续干活，
+# [CN] 直到真的要读 .tensors 时才等待通信完成，从而把等待藏进计算里。
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -158,6 +184,7 @@ class AsyncIntermediateTensors(IntermediateTensors):
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
 
+    # [CN] _comm_waited 保证只等一次（句柄 wait 不可重复）。
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
@@ -169,6 +196,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
                 fn()
         self._comm_waited = True
 
+    # [CN] 魔术点：拦截 .tensors 访问，首次访问时先等通信完成。
+    # [CN] 用 object.__getattribute__ 是为了避免递归回本方法。
     def __getattribute__(self, name: str):
         # ensure `.tensors` is ready before use
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
@@ -176,6 +205,7 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+# [CN] GPU Worker：worker 进程的主对象。
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -193,26 +223,31 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        # [CN] 浮点 matmul 精度按环境变量设置（tf32 / bf16 等）。
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
 
+        # [CN] 弹性 EP：允许运行时扩容专家并行组。
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
         self.worker_sentinel: WorkerSentinel | None = None
+        # [CN] 容错哨兵：开启后周期性上报心跳，供外部判定 worker 是否假死。
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self)
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_draft_buffers: dict[str, torch.Tensor] = {}
 
+        # [CN] 权重传输引擎要持有 model 引用，所以只能在 load_model 之后创建。
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._weight_update_is_draft = False
 
+        # [CN] profiler 惰性创建：需要 rank 等信息才能拼出合适的 trace 名。
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
         # so we have all the information needed for proper trace naming.
@@ -221,12 +256,14 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
 
+        # [CN] 上一步 PP 发送的 device 句柄，下一步开头统一 wait（见 execute_model）。
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
 
+    # [CN] 休眠后端惰性解析：不同平台（CUDA/XPU）实现不同。
     @property
     def sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
@@ -239,10 +276,12 @@ class Worker(WorkerBase):
             )
         return self._sleep_mode_backend
 
+    # [CN] 休眠：level 1 只释放 KV cache，level 2 连权重一起卸载。
     def sleep(self, level: int = 1) -> None:
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
+        # [CN] level 2 时权重内存会被真正释放，buffer 必须先搬到 CPU 存一份。
         # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
@@ -255,11 +294,14 @@ class Worker(WorkerBase):
                     name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
                 }
 
+        # [CN] suspend 通过 CuMem 内存池把整块显存归还给驱动。
         self.sleep_mode_backend.suspend(level)
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
             suspend_device_comms()
 
+        # [CN] 再同步一次并校验「空闲显存确实变多了」。
         torch.accelerator.synchronize()
+        # [CN] ROCm 上显存释放是异步的，给 5 秒等待窗口；CUDA 上应立即生效。
         deadline = time.monotonic() + (5.0 if current_platform.is_rocm() else 0)
         while True:
             free_bytes_after_sleep, total = torch.accelerator.get_memory_info()
@@ -268,6 +310,7 @@ class Worker(WorkerBase):
                 break
             time.sleep(0.1)
 
+        # [CN] 若到 deadline 仍是负数，说明真的出错了，断言兜底。
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
         logger.info(
@@ -276,11 +319,13 @@ class Worker(WorkerBase):
             format_gib(used_bytes),
         )
 
+    # [CN] 唤醒：恢复内存池，并把 level 2 时保存的 buffer 拷回 GPU。
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.sleep_mode_backend.resume(tags)
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
             resume_device_comms()
 
+        # [CN] 只有唤醒 weights 这个 tag 时才恢复 buffer（KV cache 不用恢复）。
         # Restore the buffers after level 2 sleep
         wake_weights = tags is None or "weights" in tags
         if wake_weights and len(self._sleep_saved_buffers):
@@ -306,6 +351,7 @@ class Worker(WorkerBase):
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
 
+    # [CN] 决定是否用 CuMem 内存池。权重与 KV cache 分属两个 tag，便于分别休眠。
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if (
             current_platform.is_cuda_alike()
@@ -313,6 +359,7 @@ class Worker(WorkerBase):
         ):
             return nullcontext()
 
+        # [CN] XPU 未开 sleep mode 时内存池无意义，直接跳过。
         if (
             current_platform.is_xpu()
             and not self.vllm_config.model_config.enable_sleep_mode
@@ -323,12 +370,15 @@ class Worker(WorkerBase):
             return nullcontext()
 
         allocator = get_mem_allocator_instance()
+        # [CN] 权重池要求「尚未分配任何东西」：CuMem 池每进程只能有一份实例。
         if tag == "weights":
             assert allocator.get_current_usage() == 0, (
                 "CuMem allocator can only be used for one instance per process."
             )
         return allocator.use_memory_pool(tag=tag)
 
+    # [CN] 临时把 max_split_size_mb 调小以减少碎片，代价是更多 cudaMalloc。
+    # [CN] 退出时恢复原值（PyTorch 默认 SIZE_MAX 即不限制）。
     @contextmanager
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
         """Temporarily set max_split_size_mb to reduce allocator fragmentation at the
@@ -353,12 +403,15 @@ class Worker(WorkerBase):
             restore = original_value if original_value else str(_SIZE_MAX_MB)
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
+    # [CN] 设备初始化：这是 worker 启动中最「有顺序依赖」的一段。
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
+            # [CN] Ray 注入的这个环境变量会与 CUDA Graph 构建冲突，必须移除。
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
+            # [CN] 多进程单节点下，local_rank 需要叠加 DP 偏移：一个节点上可能跑多份 DP。
             if (
                 parallel_config.distributed_executor_backend
                 not in ("ray", "external_launcher")
@@ -375,9 +428,11 @@ class Worker(WorkerBase):
                     * self.parallel_config.tensor_parallel_size
                 )
 
+                # [CN] 公式：local_rank += DP_LOCAL_RANK * (TP * PP)。
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
 
+            # [CN] 发布逻辑->物理 GPU 映射，供 NIC 亲和性与 P2P 检查使用。
             # Publish the logical-to-physical mapping for topology queries
             # such as NIC affinity and P2P checks.
             assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
@@ -389,6 +444,9 @@ class Worker(WorkerBase):
                     f"local_rank {self.local_rank} is out of bounds for "
                     f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
                 )
+                # [CN] ray / external_launcher 下 nnodes 恒为 1，导致 local_world_size 退化成
+                # [CN] 全局 world_size，这个断言会误触发；而 assigned_physical_gpu_ids 本身
+                # [CN] 就是按节点给的，所以对这两种后端跳过该检查。
                 # NOTE(patch pr45026): local_world_size is derived from
                 # parallel_config.nnodes, which is only set for the "mp"
                 # multi-node backend. With the "ray"/"external_launcher"
@@ -414,6 +472,7 @@ class Worker(WorkerBase):
                     f"bounds for {torch.accelerator.device_count()} devices."
                 )
 
+            # [CN] 逻辑设备号 -> 可见设备号（考虑 CUDA_VISIBLE_DEVICES 重映射）。
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
@@ -422,6 +481,8 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            # [CN] 顺序关键：必须在打显存快照之前初始化分布式环境，
+            # [CN] 否则 NCCL 的 buffer 会被算进 KV cache 预算，运行期直接 OOM。
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -437,23 +498,28 @@ class Worker(WorkerBase):
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
 
+            # [CN] 固定随机种子，保证多卡间 dropout 等随机行为一致。
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
+            # [CN] 先 gc + empty_cache，再打快照，减少测量噪声。
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
+            # [CN] init_snapshot 是「本次启动的基线」，后续所有预算都相对它计算。
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
+        # [CN] 当前只支持 cuda 设备。
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
+        # [CN] DBO 打开时需要 2 个 ubatch 的工作区槽位。
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(
@@ -462,7 +528,9 @@ class Worker(WorkerBase):
             _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
         )
 
+        # [CN] 构造 model runner：V2（gpu/model_runner.py）还是 V1（gpu_model_runner.py）。
         # Construct the model runner
+        # [CN] 多模态 encoder-only 模型走专用 runner。
         if self.use_v2_model_runner:
             if self.vllm_config.is_mm_encoder_only:
                 from vllm.v1.worker.mm_encoder_model_runner import (
@@ -484,6 +552,7 @@ class Worker(WorkerBase):
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
+        # [CN] 只让 rank 0 上报使用统计，避免重复计数。
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -492,17 +561,21 @@ class Worker(WorkerBase):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
 
+    # [CN] 当前用内存池劫持张量分配是权宜之计，理想方案是 TorchDispatchMode。
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    # [CN] 加载权重。三个上下文：内存池（便于 sleep）+ config 上下文 + 碎片优化。
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
+            # [CN] 20 MiB 是 PyTorch 允许的最小 max_split_size_mb。
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        # [CN] EC transfer 的 worker 侧服务要在模型就绪后启动。
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
 
@@ -514,6 +587,7 @@ class Worker(WorkerBase):
                 self.model_runner.get_model(),
             )
 
+    # [CN] 运行时改配置（如 max_num_seqs）后同步给 model runner。
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
@@ -521,6 +595,7 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    # [CN] 显存画像：跑一次 dummy forward，测出「能给 KV cache 用多少显存」。
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -534,8 +609,11 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # [CN] 若上次启动存过 plan，这里直接复用（省一次 profile）。
         maybe_apply_startup_plan(self)
 
+        # [CN] 用户显式指定了 kv_cache_memory_bytes：跳过画像，但仍要跑一次 profile_run
+        # [CN] 以便为 max_num_batched_tokens 触发编译。
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -560,6 +638,7 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        # [CN] 用 dummy 输入跑一次前向，测量峰值显存。
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -568,6 +647,7 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
 
+        # [CN] 单独估计 CUDA Graph 会占多少显存（graph pool）。
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
         # torch.accelerator.get_memory_info (reliable on ROCm, as used by
@@ -581,6 +661,7 @@ class Worker(WorkerBase):
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
+        # [CN] 是否把 CUDA Graph 的估计计入预算由 opt-in 开关控制。
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
@@ -591,6 +672,7 @@ class Worker(WorkerBase):
         init_free_memory = self.init_snapshot.free_memory
         free_gpu_memory = profile_result.after_profile.free_memory
         rocm_fallback = maybe_rocm_profiling_fallback(profile_result)
+        # [CN] 正常路径：断言「空闲显存没有变多」，变多说明别的进程在放显存，测量失真。
         if rocm_fallback is None:
             # NOTE(woosuk): Here we assume that the other processes using the same
             # GPU did not change their memory usage during the profiling.
@@ -603,6 +685,7 @@ class Worker(WorkerBase):
                 "To fix this, ensure consistent GPU memory allocation or "
                 "isolate vLLM in its own container."
             )
+        # [CN] ROCm 兜底路径：用 torch reserved 量替代差值。
         else:
             profile_result.total_consumed = rocm_fallback
             profile_result.non_kv_cache_memory = (
@@ -615,6 +698,7 @@ class Worker(WorkerBase):
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
+        # [CN] 可用 KV cache 显存 = 请求到的预算 - 非 KV 部分 - CUDA Graph 估计。
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
@@ -639,6 +723,8 @@ class Worker(WorkerBase):
             format_gib(self.available_kv_cache_memory_bytes),
         )
 
+        # [CN] 提示用户：开启 CUDA Graph 画像后，等效的 gpu_memory_utilization 变了，
+        # [CN] 要让 KV cache 大小和以前一致就得把 utilization 调高。
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
@@ -684,6 +770,7 @@ class Worker(WorkerBase):
             getattr(self.parallel_config, "_api_process_count", 1),
         )
 
+    # [CN] 返回本 worker 的 KV connector 握手元数据，键是 (pp_rank, tp_rank)。
     def get_kv_connector_handshake_metadata(
         self,
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
@@ -708,6 +795,7 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    # [CN] max_model_len=-1 自动适配显存后，把最终值同步给 worker。
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine
@@ -720,19 +808,24 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+    # [CN] 真正分配 KV cache 显存。
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        # [CN] 画像后块数可能变了，先回填给本地 config（warmup 阶段要用）。
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
+        # [CN] 采纳 EngineCore 选定的布局。后建的 worker（如弹性 EP 扩容）只能从 config 看到。
         # Adopt the engine core's layout; workers spawned after resolution
         # (e.g. elastic EP scale-up) only see it through the config.
         if kv_cache_config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
 
+        # [CN] 顺序关键：connector 必须在 initialize_kv_cache 之前初始化，
+        # [CN] 因为后者会注入与 connector 无关的 group（如 KV cache 共享层）。
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
@@ -747,9 +840,12 @@ class Worker(WorkerBase):
             ),
         )
 
+        # [CN] routed experts 捕获器：用于把 MoE 路由结果回传给 EngineCore（分析用）。
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        # [CN] KV 清零的元数据张量要在 CuMem 池外部分配，
+        # [CN] 否则 sleep/wake 时这些记账张量会被一起释放掉。
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
@@ -758,10 +854,13 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+    # [CN] 编译与 warmup：启动期最耗时的一段。
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
+        # [CN] 只为「不在 CUDA Graph 捕获尺寸里」的尺寸做编译 warmup
+        # [CN] （如 chunked prefill 的最大批）。
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             # warm up sizes that are not in cudagraph capture sizes,
             # but users still want to compile for better performance,
@@ -775,6 +874,7 @@ class Worker(WorkerBase):
                 cg_capture_sizes = [] if cg_sizes is None else cg_sizes
                 warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
 
+            # [CN] 每个编译区间至少要有一个尺寸被 warmup 到，否则补上区间末端。
             compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
             # For each compile_range, if none of the batch sizes
             # in warmup_sizes or cudagraph_capture_sizes are in the range,
@@ -785,24 +885,30 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+        # [CN] 从大到小 warmup：先占大块显存，减少碎片。
+        # [CN] skip_eplb：不希望把 dummy 数据记进 EPLB 的统计。
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
+        # [CN] 在捕获 CUDA Graph 之前先 warmup / autotune 算子。
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
 
+        # [CN] V2：捕获后不能再 resize 工作区（会释放 graph 指向的显存），故提前 warmup。
         if self.use_v2_model_runner:
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
 
+        # [CN] 捕获 CUDA Graph（eager 模式跳过）。
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
 
+        # [CN] 对比「实际 graph 显存」与「画像时的估计」，用于校准估计模型。
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
             hasattr(self, "cudagraph_memory_estimate")
@@ -819,6 +925,7 @@ class Worker(WorkerBase):
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
 
+        # [CN] 给用户一个建议值：把 gpu_memory_utilization 换成显式的 kv-cache-memory。
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
         ):
@@ -832,6 +939,7 @@ class Worker(WorkerBase):
 
             # empirically observed that the memory profiling may
             # slightly underestimate the memory consumption.
+            # [CN] 经验值：画像会略微低估，留 150 MiB 余量防 OOM。
             # So leave a small buffer (=150MiB) to avoid OOM.
             redundancy_buffer_memory = 150 * (1 << 20)
 
@@ -877,6 +985,8 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
+        # [CN] V1 专用：预热采样器并预分配 logits 等最大形状的缓冲，避免运行期碎片。
+        # [CN] 必须在 capture_model 之后做 —— 否则会被 empty_cache 清掉。
         if not self.use_v2_model_runner and get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -899,10 +1009,13 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # [CN] 重置随机种子：warmup / 画像不应影响推理时的随机状态。
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        # [CN] 提前触发 inductor 的一次性惰性初始化，
+        # [CN] 避免在运行期首次编译缓存 miss 时才做，造成延迟毛刺。
         # Eagerly trigger inductor's once-per-process lazy inits during
         # warmup (rather than on a later compile cache-miss at runtime).
         c_config = self.compilation_config
@@ -913,6 +1026,7 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        # [CN] warmup 结束后开启 JIT 监控：运行期再出现编译就告警。
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
@@ -922,15 +1036,18 @@ class Worker(WorkerBase):
             verbose=self.observability_config.jit_monitor_verbose,
         )
 
+        # [CN] 冻结 GC 堆：让 GC 不再扫描权重/KV cache/graph 这类静态大对象，降低抖动。
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
 
+        # [CN] 稳态服务阶段开启 GPU 同步检查（VLLM_GPU_SYNC_CHECK）。
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
         enable_gpu_sync_check()
 
+        # [CN] 稳态下 torch intra-op 并行只会带来 CPU 争用，关掉。
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
@@ -952,6 +1069,7 @@ class Worker(WorkerBase):
     def get_draft_model(self) -> nn.Module | None:
         return self.model_runner.get_draft_model()
 
+    # [CN] 能否在线更新草稿模型权重：需要引擎支持 + 真的配了草稿模型。
     def supports_draft_weight_updates(self) -> bool:
         engine = self.weight_transfer_engine
         speculative_config = self.speculative_config
@@ -985,6 +1103,7 @@ class Worker(WorkerBase):
             draft_model, speculative_config.draft_model_config
         )
 
+    # [CN] 上报模型支持的任务类型（generate / embed / classify 等）。
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
@@ -997,6 +1116,7 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    # [CN] 给 profiler trace 加注释，便于区分每轮的 context/generation。
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
@@ -1010,6 +1130,7 @@ class Worker(WorkerBase):
 
         iteration_details = compute_iteration_details(scheduler_output)
 
+        # [CN] 详细模式下计算 roofline 指标：qq 近似 QK^T 计算量，qk 近似访存量。
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
             # (context vs generation). These help estimate compute and
@@ -1110,6 +1231,7 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
+    # [CN] 采样阶段（async scheduling 下与 execute_model 分离）。
     @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(
@@ -1117,11 +1239,13 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    # [CN] 执行一步前向。这是每步都会走的热路径。
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # [CN] 先等上一步的 PP 发送完成，否则本步会覆写它们还在读的缓冲。
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         if self._pp_send_work:
@@ -1136,6 +1260,8 @@ class Worker(WorkerBase):
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
 
+        # [CN] PP + sequence parallel 时需要预先判断 residual 是否分散，
+        # [CN] 这里先算一次 batch_desc（有重复计算，官方标注为待重构）。
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
@@ -1165,6 +1291,7 @@ class Worker(WorkerBase):
                 )
             }
 
+        # [CN] 非首个 PP rank：异步接收上一 stage 的中间张量。
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1179,10 +1306,12 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        # [CN] 在 profiler 注释上下文里执行前向。
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            # [CN] V2 的 pooling 模型前向不直接产出输出，需要再调一次 pool()。
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1194,6 +1323,7 @@ class Worker(WorkerBase):
             ):
                 return output
 
+        # [CN] 返回 IntermediateTensors 说明本 rank 是中间 stage，需要发给下一 stage。
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         assert (
@@ -1201,6 +1331,8 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        # [CN] 非阻塞发送。metadata 句柄由 GroupCoordinator 惰性回收，
+        # [CN] device 句柄留到下一步开头再 wait（见函数开头）。
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
@@ -1213,9 +1345,11 @@ class Worker(WorkerBase):
 
         return None
 
+    # [CN] 取走草稿 token（取走即清空）。
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    # [CN] 启停 profiler。支持 torch / cuda / proton 三种后端。
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
@@ -1239,6 +1373,7 @@ class Worker(WorkerBase):
             else:
                 trace_name = rank_suffix
 
+            # [CN] 只在首次 start 时创建 wrapper，之后复用。
             # Create the profiler wrapper only on the first start call
             if self.profiler is None:
                 if profiler_type == "torch":
@@ -1275,15 +1410,18 @@ class Worker(WorkerBase):
             try:
                 self.profiler.stop()
             finally:
+                # [CN] proton 的输出名在构造时就固定了，为了让新的 prefix 生效必须重建。
                 if self.profiler_config.profiler == "proton":
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
 
+    # [CN] 跑一个 dummy batch：DP wave 同步等场景用。
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
+    # [CN] LoRA 的增删改查都直接转给 model runner。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 
@@ -1296,6 +1434,7 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    # [CN] 进程还活着就算健康（不做更深入的检查）。
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
@@ -1322,6 +1461,7 @@ class Worker(WorkerBase):
             model_config=self.model_config,
         )
 
+    # [CN] 权重在线更新（RLHF 等场景）：start -> update_weights* -> finish 三段式。
     def _check_weight_transfer_engine(self) -> None:
         if self.weight_transfer_engine is None:
             raise RuntimeError(
@@ -1329,6 +1469,7 @@ class Worker(WorkerBase):
                 "Please set weight_transfer_config to enable weight transfer."
             )
 
+    # [CN] 初始化传输引擎。NCCL 后端会在这里与 trainer 建通信组。
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         """
         Initialize weight transfer mechanism.
@@ -1343,6 +1484,7 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
+    # [CN] 开始一次权重更新会话。
     def start_weight_update(self) -> None:
         """
         Start a new weight update session.
@@ -1362,6 +1504,7 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update(is_draft=True)
 
+    # [CN] 会话的具体准备工作。
     def _start_weight_update(self, is_draft: bool = False) -> None:
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
@@ -1372,6 +1515,7 @@ class Worker(WorkerBase):
                 "draft model weight updates."
             )
 
+        # [CN] 不允许并发会话：必须先 finish 再 start。
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is already "
@@ -1382,12 +1526,14 @@ class Worker(WorkerBase):
             if is_draft:
                 self._set_draft_weight_update_target()
             self.weight_transfer_engine.start_weight_update()
+        # [CN] 任何异常都要把 target 复位，避免影响下一次会话。
         except BaseException:
             self.weight_transfer_engine.reset_weight_update_target()
             raise
         self._weight_update_active = True
         self._weight_update_is_draft = is_draft
 
+    # [CN] 接收一个权重分片。
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """
         Receive one weight update chunk from the trainer.
@@ -1411,6 +1557,7 @@ class Worker(WorkerBase):
 
         with set_current_vllm_config(self.vllm_config):
             try:
+                # [CN] 传列表时按 DP 组 + rank 索引取自己那一份。
                 if isinstance(update_info, list):
                     parallel_config = self.vllm_config.parallel_config
                     local_update_info = update_info[
@@ -1420,6 +1567,7 @@ class Worker(WorkerBase):
                 else:
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
+            # [CN] 失败时立刻结束会话并复位 target，不能留在半更新状态。
             except BaseException:
                 self._weight_update_active = False
                 self.weight_transfer_engine.reset_weight_update_target()
@@ -1440,11 +1588,14 @@ class Worker(WorkerBase):
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
 
+        # [CN] 权重传输绕过了 reload_weights，所以 LoRA 状态要手动重置。
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
 
+    # [CN] 关停：解冻 GC、关各类传输服务、释放 model runner 与 CuMem 池。
     def shutdown(self) -> None:
+        # [CN] 先解冻 GC：否则后续销毁大量对象时 GC 无法回收。
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
@@ -1468,6 +1619,8 @@ class Worker(WorkerBase):
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
         # interpreter finalization (pytorch/pytorch#145168).
+        # [CN] 趁 pluggable allocator 的包装与回调还活着时释放内存池，
+        # [CN] 否则 MemPool 的销毁会被推迟到解释器退出阶段（pytorch#145168）。
         if current_platform.is_cuda_alike():
             from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -1478,6 +1631,7 @@ class Worker(WorkerBase):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
+# [CN] 初始化分布式环境：进程组 + 模型并行组 + EC connector。
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
@@ -1489,19 +1643,23 @@ def init_worker_distributed_environment(
     parallel_config = vllm_config.parallel_config
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
+    # [CN] batch invariance：保证同 batch 内结果与 batch 组成无关（确定性推理）。
     init_batch_invariance()
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),
     )
+    # [CN] custom all-reduce 是 vLLM 自研的高效 all-reduce，可被配置禁用。
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     init_method = distributed_init_method or "env://"
 
+    # [CN] 分布式超时：默认用 PyTorch 的默认值，可由配置覆盖。
     timeout = None
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)
 
+    # [CN] 建 torch 分布式进程组。
     init_distributed_environment(
         parallel_config.world_size,
         rank,
@@ -1511,6 +1669,7 @@ def init_worker_distributed_environment(
         timeout,
     )
 
+    # [CN] 建 TP / PP / PCP / DCP 各模型并行组。
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
@@ -1518,6 +1677,7 @@ def init_worker_distributed_environment(
         parallel_config.decode_context_parallel_size,
     )
 
+    # [CN] EC connector 要在 KV cache 初始化之前建好。
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)

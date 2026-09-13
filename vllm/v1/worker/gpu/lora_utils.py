@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：LoRA 与 CUDA graph 的耦合处理。
+# [CN] 难点：LoRA 会让 CUDA graph 的输入形状与 kernel 选择发生变化，
+# [CN] 因此「激活了几个 LoRA」本身就是 graph 捕获的一个维度。
 """LoRA utilities for the Model Runner V2 and cudagraph."""
 
 from collections.abc import Callable
@@ -14,9 +18,14 @@ if TYPE_CHECKING:
     from vllm.config.compilation import CompilationConfig
     from vllm.config.lora import LoRAConfig
 
+# [CN] 0 保留为「无 LoRA」的哨兵 ID（与 LoRARequest.lora_int_id 从 1 开始配套）。
 NO_LORA_ID = 0
 
 
+# [CN] 枚举需要为哪些「激活 LoRA 数」各捕一套图：
+# [CN]   开启 specialize —— 2 的幂 + max_loras+1（精细但图多）；
+# [CN]   否则            —— 只要 [0, max_loras+1] 两套（粗但省显存）；
+# [CN]   未启用 LoRA     —— 只要 [0]。
 def get_lora_capture_cases(
     lora_config: "LoRAConfig | None",
     compilation_config: "CompilationConfig",
@@ -36,6 +45,8 @@ def get_lora_capture_cases(
     return [0, lora_config.max_loras + 1]
 
 
+# [CN] 运行期决定本步命中哪套图。
+# [CN] dummy run 时一律按 max_loras+1（最坏情况）选，保证捕获与运行一致。
 def get_num_active_loras_for_dispatch(
     lora_config: "LoRAConfig | None",
     lora_state: "LoraState",
@@ -50,6 +61,8 @@ def get_num_active_loras_for_dispatch(
     return 0
 
 
+# [CN] 捕获图之前的钩子：按目标「激活数」挑一组 dummy LoRA 装上，
+# [CN] 使捕获到的图里 LoRA 权重的形状与运行期一致。
 def create_lora_capture_hook(
     lora_config: "LoRAConfig | None",
     runner: Any,
@@ -73,6 +86,7 @@ def create_lora_capture_hook(
     return hook
 
 
+# [CN] 每请求的 LoRA 状态：slot -> lora_int_id，以及 req_id -> LoRARequest。
 class LoraState:
     def __init__(self, max_num_reqs: int):
         self.lora_ids = np.zeros(max_num_reqs, dtype=np.int32)
@@ -92,6 +106,9 @@ class LoraState:
     def remove_request(self, req_id: str) -> None:
         self.lora_requests.pop(req_id, None)
 
+    # [CN] 生成两种映射：
+    # [CN]   prompt_lora_mapping —— 每请求一个 id（给 punica 的 prompt 维）；
+    # [CN]   token_lora_mapping  —— 每 token 一个 id（按 num_scheduled_tokens 展开）。
     def make_lora_inputs(
         self,
         req_ids: list[str],

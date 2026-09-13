@@ -26,12 +26,18 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
+# [CN] 文件总览：把「KV 传输」（P/D 分离、offloading 等）封装成 runner 可插拔接口。
+# [CN] 设计要点：用空实现（NO_OP）替代到处写 if has_kv_transfer_group()，
+# [CN] 让主链路代码保持干净。
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    # [CN] 前向之前：处理抢占、绑定本步元数据、按需启动 KV 加载。
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
+    # [CN] 前向之后：补发异步加载、等保存完成、收集完成/失败块与统计，
+    # [CN] 最后清空本步元数据（否则下一步会读到陈旧数据）。
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
@@ -44,6 +50,7 @@ class KVConnector:
         pass
 
 
+# [CN] 真正干活的实现，持有全局 kv_transfer_group。
 class ActiveKVConnector(KVConnector):
     def __init__(
         self, vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
@@ -57,6 +64,8 @@ class ActiveKVConnector(KVConnector):
         self._pending_load_start = False
         self._disabled = False
 
+    # [CN] 同步加载必须在本步前向「之前」完成（否则读不到）；
+    # [CN] 异步加载则推迟到 post_forward 再发起，把主机侧提交开销挪出关键路径。
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:
             return
@@ -107,6 +116,7 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.clear_connector_metadata()
         return output
 
+    # [CN] 本步没有任何 token 要算（纯 KV 传输步）：只做收发，不走模型。
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -116,6 +126,8 @@ class ActiveKVConnector(KVConnector):
         kv_connector_output = self.post_forward(finished_req_ids, wait_for_save=False)
         return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
+    # [CN] 禁用时必须同时清掉 KV_CONNECTOR_AGENT 全局量，
+    # [CN] 否则各层里的 connector 钩子仍会被调用。
     def set_disabled(self, disabled: bool) -> None:
         # Ensure that layer-wise connector hooks aren't called when disabled.
         kv_transfer_state._KV_CONNECTOR_AGENT = None if disabled else self.kv_connector
@@ -125,6 +137,7 @@ class ActiveKVConnector(KVConnector):
 NO_OP_KV_CONNECTOR = KVConnector()
 
 
+# [CN] 工厂：没配置传输组就返回空实现，主链路无感。
 def get_kv_connector(
     vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
 ) -> KVConnector:

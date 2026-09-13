@@ -1,5 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：V2 runner 的 CUDA graph 管理。
+# [CN] 核心问题：CUDA graph 要求「捕获时与回放时的形状、地址完全一致」，
+# [CN] 而真实 batch 的 token 数是任意的。解法是：
+# [CN]   1) 预先为一组离散的 token 数各捕一张图（cudagraph_capture_sizes）；
+# [CN]   2) 运行期把真实 batch padding 上去「就近向上匹配」一张图。
+# [CN] 本文件负责：候选图枚举、捕获、运行期分发、显存画像。
+# [CN] 三种图模式：
+# [CN]   FULL      —— 整图，连 attention 一起；要求最严、收益最大；
+# [CN]   PIECEWISE —— 分段图，attention 处打断，兼容不支持入图的后端；
+# [CN]   NONE      —— 不捕图（eager）。
 import gc
 import itertools
 from collections import defaultdict
@@ -56,6 +67,9 @@ class AttentionState(NamedTuple):
 
 
 @dataclass(frozen=True)
+# [CN] 「一张图」的身份标识。运行期用它做匹配：
+# [CN] 只有形状与模式都对得上，才能回放这张图。
+# [CN] 注意 num_reqs=None 表示「不约束请求数」——PIECEWISE 图不需要请求 padding。
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
     matches between the capture and runtime."""
@@ -95,6 +109,10 @@ class CreateForwardFn(Protocol):
     ) -> Callable[[CUDAGraphMode], None]: ...
 
 
+# [CN] 运行期匹配规则（都是「图 >= 需求」的方向）：
+# [CN]   uniform_token_count 为 None 的图（PIECEWISE）可接受任意 token 分布；
+# [CN]   max_query_len 为 None 表示图不约束 query 长度；
+# [CN]   num_ubatches 必须严格相等 —— 为 N 路切分捕的图只能服务 N 路切分。
 def _is_compatible(
     desc: BatchExecutionDescriptor,
     num_reqs: int,
@@ -134,6 +152,9 @@ def has_compiled_submodule(model: nn.Module) -> bool:
     )
 
 
+# [CN] 图的持有者与分发者。
+# [CN] 关键性能设计：_candidates 把「(token 数, LoRA 数) -> 候选图列表」
+# [CN] 预先展开成字典，使运行期 dispatch 是一次字典查找而非每次二分。
 class CudaGraphManager:
     def __init__(
         self,
@@ -185,6 +206,8 @@ class CudaGraphManager:
 
         self._init_candidates()
 
+    # [CN] 预先把「任意激活 LoRA 数」映射到「能服务它的最小已捕获档位」，
+    # [CN] 这样 dispatch 时不必每次做 bisect。
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
 
@@ -211,6 +234,11 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    # [CN] 枚举所有要捕的图。三种分支：
+    # [CN]   varlen decode  —— 每请求 1..decode_query_len 任意混合，按最坏情况建；
+    # [CN]   uniform decode —— 每请求 token 数相同（含 spec decode 的 1+K）；
+    # [CN]   mixed          —— prefill/decode 混合，PIECEWISE 不约束请求数。
+    # [CN] 动态投机解码下 token 数有多种取值，需要为每个取值都建一套图。
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -432,6 +460,8 @@ class CudaGraphManager:
             {desc.num_tokens for desc in self.graphs if desc.num_active_loras == 0}
         )
 
+    # [CN] 运行期分发：找不到匹配图就退化成 NONE（eager 执行），
+    # [CN] 保证功能正确优先于性能。
     def dispatch(
         self,
         num_reqs: int,
@@ -465,6 +495,9 @@ class CudaGraphManager:
             num_ubatches=num_ubatches,
         )
 
+    # [CN] 回放前必须同步 offloader 的拷贝流：
+    # [CN] 上一步 eager 迭代可能在 copy_stream 上排了 H2D，
+    # [CN] 而图里记录的 event 看不见它们，回放会覆盖正在被读的静态缓冲。
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (
@@ -494,6 +527,10 @@ class CudaGraphManager:
         return self.breakable_cg_runner(**model_inputs)
 
 
+# [CN] 在通用管理器之上补两件事：
+# [CN]   1) 捕获时按模型类型准备 dummy 输入；
+# [CN]   2) 回放后把 hidden_states / aux_hidden_states / intermediate_tensors
+# [CN]      从持久缓冲里切出来返回（图内不能直接返回新张量）。
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
 
@@ -519,6 +556,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
 
+    # [CN] 捕获顺序有讲究：先 PIECEWISE 再 FULL。
+    # [CN] PIECEWISE 的激活更大，先捕它可以让 FULL 复用已分配的图池内存。
+    # [CN] FULL 与「可打断 PIECEWISE」都要 warmup 一次再正式捕：
+    # [CN] 因为 attention 后端可能在 warmup 期间改写或惰性初始化 metadata。
     def capture(
         self,
         model: nn.Module,
@@ -549,6 +590,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 or cudagraph_mode=NONE/FULL."
             )
 
+        # [CN] 返回的闭包捕获了本张图所需的全部输入（在图外准备好），
+        # [CN] 捕获时只需调用它 —— 这是「图内不能做 Python 逻辑」的标准绕法。
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
             warmup: bool,
@@ -591,6 +634,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                 pcp_manager=pcp_manager,
             )
 
+            # [CN] 标记所有 dummy 行为 padding：让 kernel 跳过它们，
+            # [CN] 否则 padding 行会被当成真实请求算进结果。
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
 
@@ -671,6 +716,12 @@ class ModelCudaGraphManager(CudaGraphManager):
         return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
 
 
+# [CN] 为捕获构造 dummy 输入与 attention metadata。
+# [CN] 这里有一处重要的不对称：
+# [CN]   FULL 图     —— for_capture=True，产出「可捕获」的 metadata；
+# [CN]   PIECEWISE 图 —— for_capture=False，因为标准 attention 是断点，
+# [CN]     会在图外 eager 执行；但 attention-like 算子（sconv、DSV4 压缩器）
+# [CN]     不是断点，仍需要它们的 metadata 才能执行并被捕获。
 def prepare_inputs_to_capture(
     num_reqs: int,
     num_tokens: int,
@@ -754,6 +805,13 @@ _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
 @torch.inference_mode()
+# [CN] 在真正分配 KV cache 之前，估算捕获图要吃多少显存，以便预留。
+# [CN] 手法：起一个最小 KV cache -> 跑一次完整捕获 -> 全部丢弃。
+# [CN] 两个坑：
+# [CN]   1) 必须用「一次性图池」：若把 profiling 图捕进持久全局池再丢弃，
+# [CN]      池的 use_count 会降到 0，真正捕获时触发 c10 的断言失败；
+# [CN]   2) profiling 图必须全部丢弃：它们记录的是临时状态，
+# [CN]      回放会导致 use-after-free（inductor 会回收旧图的 storage）。
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
@@ -859,6 +917,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         platform_cls._global_graph_pool = saved_global_pool
 
 
+# [CN] 只捕 FULL 中最大的两张来外推总量：
+# [CN] 第一次捕获会分配池基线，后续图基本复用它，因此用第二个样本作为单图成本。
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
     """Extrapolate the total FULL capture cost from samples of the largest
     graphs. The first capture allocates the pool baseline; later graphs mostly
@@ -897,6 +957,10 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     runner.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
 
+# [CN] 拆掉 profiling 状态但保留模型权重。
+# [CN] 刻意清掉 align 模式下缓存的 Mamba group 元数据：
+# [CN] 真正的（可能经过 PP 投影的）配置可能把 Mamba 层分到不同的 group，
+# [CN] 必须按真实配置重新推导。
 def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     """Release the profiling KV cache and captured graphs while keeping model
     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""

@@ -1,6 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [CN] 文件总览：Worker 的两层抽象。
+# [CN] 链路：Executor --collective_rpc--> WorkerWrapperBase --> WorkerBase
+# [CN]        --> ModelRunner。
+# [CN] 为什么要两层：
+# [CN]   - WorkerBase：与硬件/模型相关的真正实现（GPU / CPU / XPU ...）；
+# [CN]   - WorkerWrapperBase：进程级外壳，负责「延迟初始化 + 生命周期 + 环境变量」，
+# [CN]     并把所有未知属性通过 __getattr__ 透传给内部 worker。
+# [CN] 核心类：
+# [CN]   - CompilationTimes：编译耗时（语言模型 / encoder 分开计）。
+# [CN]   - WorkerBase：worker 接口定义，绝大多数方法是 NotImplementedError。
+# [CN]   - WorkerWrapperBase：进程外壳，支持 worker_extension_cls 动态混入。
+# [CN] 最容易看错的点：
+# [CN]   1) WorkerWrapperBase.__getattr__ 让 wrapper 看起来「什么方法都有」，
+# [CN]      实际上全部转发给 self.worker；调试时断点要打在真正的 worker 上。
+# [CN]   2) rpc_rank 与 global_rank 不是一回事 —— SPMD 多引擎场景下
+# [CN]      每个 executor 只有一个 worker（rpc_rank=0），但 TP 组里 rank 各不相同。
+
+
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
@@ -36,11 +54,14 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 
+# [CN] 编译耗时统计。分「语言模型」和「encoder」两项，
+# [CN] 因为多模态模型的视觉塔编译与主模型是分开计时的。
 class CompilationTimes(NamedTuple):
     language_model: float
     encoder: float
 
 
+# [CN] Worker 接口：隔离不同硬件实现，同时抽象控制面通信。
 class WorkerBase:
     """Worker interface that allows vLLM to cleanly separate implementations for
     different hardware. Also abstracts control plane communication, e.g., to
@@ -79,6 +100,7 @@ class WorkerBase:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.compilation_config = vllm_config.compilation_config
 
+        # [CN] 延迟导入 platform：避免 worker_base 被导入时就触发平台探测。
         from vllm.platforms import current_platform
 
         self.current_platform = current_platform
@@ -93,6 +115,8 @@ class WorkerBase:
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
 
+        # [CN] IR op 优先级与 torch-wrap 开关是进程级常量，必须在 worker 生命周期开始时就固定，
+        # [CN] 中途修改会导致已编译的图与运行时行为不一致。
         # IR op priority and torch-wrap state are constant for the worker's
         # lifetime.
         vllm_config.kernel_config.ir_op_priority.set_default()
@@ -100,19 +124,24 @@ class WorkerBase:
             vllm_config.compilation_config.ir_enable_torch_wrap
         )
 
+    # [CN] 向 EngineCore 上报本 worker 需要的 KV cache 规格。
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
 
+    # [CN] 上报本 worker 所有 attention 后端都支持的布局，按偏好排序。
+    # [CN] 由 EngineCore 取交集后决定最终布局，再 set_kv_cache_layout 下发。
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Layout names every attention backend supports, most preferred first."""
         backends = get_current_attn_backends(self.vllm_config)
         return [layout.name for layout in get_supported_kv_cache_layouts(backends)]
 
+    # [CN] 采纳 EngineCore 选定的布局并写回 cache_config。
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         """Adopt the KV cache layout resolved by the engine core."""
         record_kv_cache_layout(self.vllm_config.cache_config, kv_cache_layout)
 
+    # [CN] torch.compile + CUDA Graph 捕获。只在启动阶段调用一次。
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.
 
@@ -125,18 +154,21 @@ class WorkerBase:
         """Basic health check (override for device-specific checks)."""
         return
 
+    # [CN] 等待设备上的在途工作完成。非 torch.accelerator 体系（如某些 NPU）需覆写。
     def synchronize_device(self) -> None:
         """Block until in-flight device work completes; backends outside
         ``torch.accelerator`` must override with their own wait."""
         if torch.accelerator.is_available():
             torch.accelerator.synchronize()
 
+    # [CN] 初始化设备并做常驻显存分配（不含权重加载，那是 load_model 的事）。
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
         memory allocations.
         """
         raise NotImplementedError
 
+    # [CN] 用 getattr + callable 判断：不是所有 worker 都有多模态缓存。
     def reset_mm_cache(self) -> None:
         reset_fn = getattr(self.model_runner, "reset_mm_cache", None)
         if callable(reset_fn):
@@ -145,10 +177,12 @@ class WorkerBase:
     def get_model(self) -> nn.Module:
         raise NotImplementedError
 
+    # [CN] 是否支持在线更新投机模型的权重（默认不支持）。
     def supports_draft_weight_updates(self) -> bool:
         """Whether this worker can update its configured speculative model."""
         return False
 
+    # [CN] 在 worker 进程内对模型执行任意函数——避免把模型传回主进程。
     def apply_model(self, fn: Callable[[nn.Module], _R]) -> _R:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
@@ -159,10 +193,13 @@ class WorkerBase:
 
         return format_model_inspection(self.get_model())
 
+    # [CN] 加载权重到设备。load_dummy_weights 用于 profile 阶段（不读真实权重）。
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load model onto target device."""
         raise NotImplementedError
 
+    # [CN] 执行一步前向。返回 None 表示「前向已提交但采样还没做」，
+    # [CN] 此时必须紧接着调用 sample_tokens —— 这是 async scheduling 的两阶段拆分。
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
@@ -174,12 +211,14 @@ class WorkerBase:
         """
         raise NotImplementedError
 
+    # [CN] 仅在 execute_model 返回 None 时调用，用于补上采样结果。
     def sample_tokens(
         self, grammar_output: GrammarOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
 
+    # [CN] 单个 KV block 的字节数，投机解码下用于计算草稿模型的显存开销。
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
         speculative decoding.
@@ -198,6 +237,7 @@ class WorkerBase:
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    # [CN] 词表大小直接从 config 取，不碰模型（模型可能还没加载）。
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""
@@ -208,6 +248,9 @@ class WorkerBase:
         return
 
 
+# [CN] 进程级外壳：一个 executor/engine 进程对应一个 wrapper。
+# [CN] 设计动机：worker 真正初始化前需要先设置好环境变量、插件、分布式组，
+# [CN] 这些必须在「独立进程里、且顺序可控」地完成，所以拆出这一层。
 class WorkerWrapperBase:
     """
     This class represents one process in an executor/engine. It is responsible
@@ -217,6 +260,7 @@ class WorkerWrapperBase:
     real initialization happens in `init_worker`.
     """
 
+    # [CN] 注意 rpc_rank（executor 内的序号）与 global_rank（分布式组内的序号）可能不同。
     def __init__(
         self,
         rpc_rank: int = 0,
@@ -243,6 +287,7 @@ class WorkerWrapperBase:
         if self.worker is not None:
             self.worker.shutdown()
 
+    # [CN] 按 rpc_rank 取出属于自己的那份环境变量并应用。
     def update_environment_variables(
         self,
         envs_list: list[dict[str, str]],
@@ -250,6 +295,7 @@ class WorkerWrapperBase:
         envs = envs_list[self.rpc_rank]
         update_environment_variables(envs)
 
+    # [CN] 真正的 worker 初始化入口：注入通用逻辑后再构造 worker_class。
     @instrument(span_name="Worker init")
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
         """
@@ -264,6 +310,7 @@ class WorkerWrapperBase:
         )
         self.vllm_config = vllm_config
 
+        # [CN] 开启函数调用追踪：让 worker 内的调用也能被 tracing 捕获。
         vllm_config.enable_trace_function_call_for_thread()
 
         from vllm.plugins import load_general_plugins
@@ -271,6 +318,8 @@ class WorkerWrapperBase:
         load_general_plugins()
 
         parallel_config = vllm_config.parallel_config
+        # [CN] worker_cls 现在只接受字符串（全限定名）—— 因为 worker 可能在另一个进程里，
+        # [CN] 类对象无法跨进程序列化。
         if isinstance(parallel_config.worker_cls, str):
             worker_class: type[WorkerBase] = resolve_obj_by_qualname(
                 parallel_config.worker_cls
@@ -282,11 +331,13 @@ class WorkerWrapperBase:
                 "and pass the qualified name of the class as a string."
             )
 
+        # [CN] worker_extension_cls：允许用户在不改 vLLM 源码的前提下扩展 worker。
         if parallel_config.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(
                 parallel_config.worker_extension_cls
             )
             extended_calls = []
+            # [CN] 混入前先检查属性冲突：若 worker 已有同名属性，混入会静默覆盖，必须提前报错。
             if worker_extension_cls not in worker_class.__bases__:
                 # check any conflicts between worker and worker_extension_cls
                 for attr in dir(worker_extension_cls):
@@ -299,6 +350,7 @@ class WorkerWrapperBase:
                     )
                     if callable(getattr(worker_extension_cls, attr)):
                         extended_calls.append(attr)
+                # [CN] 运行时改 __bases__ 实现动态继承。这是 Python 层的 hack，但避免了改源码。
                 # dynamically inherit the worker extension class
                 worker_class.__bases__ = worker_class.__bases__ + (
                     worker_extension_cls,
@@ -310,12 +362,15 @@ class WorkerWrapperBase:
                     extended_calls,
                 )
 
+        # [CN] 物理 GPU id 由 executor 分配后注入（Ray/多进程场景需要显式绑定）。
         assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
         if assigned_physical_gpu_ids is not None:
             vllm_config.parallel_config.assigned_physical_gpu_ids = (
                 assigned_physical_gpu_ids
             )
 
+        # [CN] shared_worker_lock：多模态 processor 缓存用共享内存时需要跨进程加锁。
+        # [CN] 只有 mm_processor_cache_type='shm' 时才是硬需求，否则仅告警。
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:
             msg = (
@@ -338,10 +393,13 @@ class WorkerWrapperBase:
                 )
             )
 
+        # [CN] set_current_vllm_config：把 config 放进上下文，
+        # [CN] 让 worker 初始化期间能通过 get_current_vllm_config() 取到（很多模块依赖它）。
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
 
+    # [CN] 按 global_rank（不是 rpc_rank）取自己的那份 KV cache 配置。
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]
         assert self.vllm_config is not None
@@ -354,9 +412,13 @@ class WorkerWrapperBase:
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
 
+    # [CN] 属性透传：所有未定义属性都转发给内部 worker。
+    # [CN] 副作用：拼错属性名不会报 AttributeError，而是转发后报内部 worker 的错。
     def __getattr__(self, attr: str):
         return getattr(self.worker, attr)
 
+    # [CN] 多模态特征可能走共享内存缓存：执行前把新请求的 mm_features 换成共享内存版本，
+    # [CN] 避免每个 worker 进程各解码一遍图像。
     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:
         mm_cache = self.mm_receiver_cache
         if mm_cache is None:
@@ -367,6 +429,7 @@ class WorkerWrapperBase:
                 req_data.mm_features
             )
 
+    # [CN] 转发执行，但先做一次 mm 缓存替换。
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

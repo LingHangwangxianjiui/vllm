@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
 
+# [CN] 文件总览：EC = Encoder Cache。把多模态 encoder 的输出在 P/D 之间
+# [CN] （或跨实例）传输，避免重复跑 vision tower。
+# [CN] 与 kv_connector.py 同构：空实现 + 真实实现 + 工厂。
 class ECConnector:
     """EC connector interface used by the V2 GPU model runner."""
 
@@ -36,6 +39,8 @@ class ECConnector:
         return EMPTY_MODEL_RUNNER_OUTPUT
 
 
+# [CN] EC 传输的三种角色：producer（产出并 offload）、consumer（加载）、
+# [CN] ec_both（既产出又加载）。
 class ActiveECConnector(ECConnector):
     def __init__(
         self,
@@ -50,6 +55,9 @@ class ActiveECConnector(ECConnector):
         self.save_new_caches = self.ec_connector.is_producer
 
     @contextmanager
+    # [CN] 上下文管理器形式：进入时按需发起收/发，
+    # [CN] 退出时把「本步新算出来的」hash 落盘，并收集完成状态。
+    # [CN] 用 set 差集（新 hash - 进入前已有 hash）识别新增项，简单且可靠。
     def maybe_get_output(
         self, scheduler_output: "SchedulerOutput"
     ) -> Generator[ECConnectorOutput | None, None, None]:
@@ -97,6 +105,8 @@ class ActiveECConnector(ECConnector):
 NO_OP_EC_CONNECTOR = ECConnector()
 
 
+# [CN] encoder-decoder 模型不走这条路（它的 encoder 输出直接进 decoder），
+# [CN] 因此这里显式排除。
 def get_ec_connector(
     vllm_config: VllmConfig,
     encoder_cache: "EncoderCache | None",

@@ -13,16 +13,30 @@ from vllm.utils.torch_utils import (
     get_accelerator_view_from_cpu_tensor,
 )
 
+# [CN] 文件总览：V2 runner 的「缓冲与写入」基础设施。
+# [CN] 核心矛盾：CUDA graph 要求张量地址固定，但每步都要更新内容；
+# [CN] 同时 async scheduling 下 CPU 侧写入与 GPU 侧读取会重叠。
+# [CN] 本文件的解法：
+# [CN]   1) UVA（统一虚拟寻址）—— CPU 写、GPU 读同一块物理内存，无需显式拷贝；
+# [CN]   2) 轮转缓冲池 —— 多个 UVA buffer 轮着用，避免本步写覆盖上步未读完的；
+# [CN]   3) StagedWrite —— CPU 先攒「差量写」，再由一个 Triton kernel 批量落盘，
+# [CN]      把 N 次小 kernel launch 合并成 1 次。
+# [CN] 容易看错的点：UVA 不是「免拷贝」，而是「免显式拷贝」——
+# [CN] 数据仍要走 PCIe，只是地址统一、不需要 copy_ 调用。
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
 _DEFAULT_MAX_CONCURRENCY = 2
 
 
+# [CN] 轮转深度必须 >= 同时在飞的 step 数（即 engine 的 batch_queue_size），
+# [CN] 否则第 N+1 步的写入会覆盖第 N 步 GPU 还没读完的缓冲。
+# [CN] 下限取 2：至少要让「本步写」与「上步读」分开。
 def set_default_max_concurrency(n: int) -> None:
     global _DEFAULT_MAX_CONCURRENCY
     _DEFAULT_MAX_CONCURRENCY = max(2, n)
 
 
+# [CN] 异步 H2D 的封装：先 pin（已 pinned 则是 no-op），再 non_blocking copy_。
 def async_copy_to_gpu(
     x: torch.Tensor | np.ndarray,
     out: torch.Tensor | None = None,
@@ -41,6 +55,8 @@ def async_copy_to_gpu(
     return out.copy_(pinned, non_blocking=True)
 
 
+# [CN] 一块 UVA 内存的三视图：cpu（torch）、np（numpy）、uva（GPU 可寻址）。
+# [CN] 三者共享同一块物理内存，写 np 等价于写 GPU 可见数据。
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
@@ -50,6 +66,9 @@ class UvaBuffer:
         self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
 
 
+# [CN] 多块 UVA buffer 的轮转池。
+# [CN] 为什么需要轮转：async scheduling 下 CPU 侧第 N+1 步的写入，
+# [CN] 与 GPU 侧第 N 步的读取是并发的，用同一块 buffer 会读到脏数据。
 class UvaBufferPool:
     def __init__(
         self,
@@ -68,6 +87,8 @@ class UvaBufferPool:
         # Current buffer index
         self._curr = 0
 
+    # [CN] 先切到「下一块」再写——即写入的永远是「最老的」那块，
+    # [CN] 保证当前正在被 GPU 读的那块不会被改。
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
@@ -88,6 +109,9 @@ class UvaBufferPool:
         return uva.clone() if out is None else out.copy_(uva, non_blocking=True)
 
 
+# [CN] 「真值在 CPU（普通 pinned=False 内存），GPU 侧通过 UVA 池看它」。
+# [CN] 与 UvaBuffer 的区别：UvaBuffer 本身就在 UVA 上，
+# [CN] 而这里的 cpu 是普通内存，每次 copy_to_uva 才同步一份到 UVA 池。
 class UvaBackedTensor:
     def __init__(
         self,
@@ -111,6 +135,10 @@ class UvaBackedTensor:
         return self.gpu
 
 
+# [CN] 支持「攒一批写、一次性落到 GPU」的张量。
+# [CN] 只支持 int32 / int64 / float32：因为要写 Triton kernel，
+# [CN] dtype 必须是编译期可枚举的。
+# [CN] uva_instead_of_gpu=True 用于 all_token_ids 这类超大但访问稀疏的张量。
 class StagedWriteTensor:
     def __init__(
         self,
@@ -152,6 +180,9 @@ class StagedWriteTensor:
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
 
+    # [CN] 攒一次「从 index 行的 start 列开始，写入 x 序列」的写操作。
+    # [CN] 注意这里只记元数据 + 把内容 append 进一个扁平 list，
+    # [CN] 真正的 GPU 写入推迟到 apply_write。
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:
@@ -171,6 +202,8 @@ class StagedWriteTensor:
         self._staged_write_contents.append(x)
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
+    # [CN] 用一个 Triton kernel 把攒下的所有写一次性落到 GPU。
+    # [CN] cu_lens 是前缀和，kernel 里靠它定位每段内容的起止。
     def apply_write(self) -> None:
         n = len(self._staged_write_indices)
         if n == 0:
@@ -207,6 +240,9 @@ class StagedWriteTensor:
         self._staged_write_cu_lens.clear()
 
 
+# [CN] 把多个 StagedWriteTensor（例如多个 KV cache group）的差量写
+# [CN] 合并到「一个」kernel 里执行：多一次 launch 换 N 次，省 launch 开销。
+# [CN] 实现手法：给每次写带上 group_id，kernel 里按 group_id 解析基址与 stride。
 class FusedStagedWriter:
     """Applies the staged writes of several `StagedWriteTensor`s at once."""
 
@@ -272,6 +308,9 @@ class FusedStagedWriter:
 
 
 @triton.jit
+# [CN] 一个 program 对应一次写（不是一行）。
+# [CN] MULTI_GROUP=True 时 output_ptr 是「指针的数组」，需要先解引用两次
+# [CN] 才能拿到真正的行地址（见 _load_ptr）。
 def _apply_write_kernel(
     output_ptr,  # MULTI_GROUP: ptr-to-ptrs [num_groups]; else: data ptr
     output_stride,  # MULTI_GROUP: ptr-to-strides [num_groups]; else: row stride
@@ -310,6 +349,8 @@ def _apply_write_kernel(
 
 
 @triton.jit
+# [CN] 从 int64 加载出指针并转型。
+# [CN] multiple_of(ptr, 16) 是给编译器的对齐提示，能生成更好的访存指令。
 def _load_ptr(ptr_to_ptr, elem_dtype):
     ptr = tl.load(ptr_to_ptr)
     ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))

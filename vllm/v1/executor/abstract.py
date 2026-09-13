@@ -1,5 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：Executor 抽象基类与「按配置选执行器」的工厂。
+# [CN] 链路位置：EngineCore 持有唯一一个 Executor；Executor 之下是若干 Worker。
+# [CN]   SchedulerOutput --Executor.execute_model--> ModelRunnerOutput。
+# [CN] 核心类：Executor（ABC）。子类有三条主线：
+# [CN]   - UniProcExecutor：单进程，调试/TP=1；
+# [CN]   - MultiprocExecutor：多进程，默认生产路径；
+# [CN]   - RayDistributedExecutor / RayExecutorV2：Ray 编排。
+# [CN] 设计要点：
+# [CN]   1) 几乎所有能力都是 collective_rpc 的语法糖（广播给所有 worker）；
+# [CN]   2) 返回值一律是「每 worker 一个元素」的列表，基类多数方法取 [0]；
+# [CN]   3) 文件末尾为了向后兼容又导入了 UniProcExecutor，形成轻微循环引用，
+# [CN]      所以 import 被放在文件底部并标注 noqa: E402。
+# [CN] 最容易看错的点：collective_rpc 的 docstring 明确警告「只用于传控制消息」，
+# [CN]   高频张量数据必须走数据面（共享内存 / NCCL），否则性能会崩。
+
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -35,6 +51,7 @@ _R = TypeVar("_R")
 FailureCallback = Callable[[], None]
 
 
+# [CN] 执行器抽象：屏蔽「单进程 / 多进程 / Ray」的差异，向上提供统一 API。
 class Executor(ABC):
     """Abstract base class for vLLM executors."
 
@@ -42,15 +59,18 @@ class Executor(ABC):
     or it can be a distributed executor that can execute the model on multiple devices.
     """
 
+    # [CN] 两个能力标志，供 EngineCore 判断能否走某些优化路径。
     uses_ray: bool = False  # whether the executor uses Ray for orchestration.
     supports_pp: bool = False  # whether the executor supports PP
 
+    # [CN] 工厂方法：根据 parallel_config.distributed_executor_backend 选子类。
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
         executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
         distributed_executor_backend = parallel_config.distributed_executor_backend
         # distributed_executor_backend must be set in VllmConfig.__post_init__
+        # [CN] 允许直接传类对象（便于测试与自定义后端注入）。
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, Executor):
                 raise TypeError(
@@ -58,6 +78,7 @@ class Executor(ABC):
                     f"Executor. Got {distributed_executor_backend}."
                 )
             executor_class = distributed_executor_backend
+        # [CN] Ray 有 v1/v2 两代实现，由环境变量 VLLM_USE_RAY_V2_EXECUTOR_BACKEND 切换。
         elif distributed_executor_backend == "ray":
             if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
@@ -75,10 +96,12 @@ class Executor(ABC):
             from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
             executor_class = UniProcExecutor
+        # [CN] external_launcher 用 torchrun 语义启动，需要调度是确定性的。
         elif distributed_executor_backend == "external_launcher":
             # TODO: make v1 scheduling deterministic
             # to support external launcher
             executor_class = ExecutorWithExternalLauncher
+        # [CN] 字符串形式的自定义后端：按全限定名动态解析。
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             if not issubclass(executor_class, Executor):
@@ -92,6 +115,7 @@ class Executor(ABC):
             )
         return executor_class
 
+    # [CN] 构造即完成初始化（_init_executor 由子类实现）。
     @instrument(span_name="Executor init")
     def __init__(
         self,
@@ -107,6 +131,7 @@ class Executor(ABC):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        # [CN] 子类在此拉起 worker 进程 / 建 Ray actor / 直接建 worker 对象。
         self._init_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
@@ -117,15 +142,19 @@ class Executor(ABC):
     def _init_executor(self) -> None:
         raise NotImplementedError
 
+    # [CN] 把调度器算好的 KVCacheConfig 下发给每个 worker 真正分配显存。
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Initialize the KV caches on the underlying workers."""
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
 
+    # [CN] 触发 torch.compile 与 CUDA Graph 捕获（耗时大头，只在启动阶段做一次）。
     def compile_or_warm_up_model(self) -> None:
         """Compile/warm up the model and capture cudagraphs on workers."""
         compilation_times: list[CompilationTimes] = self.collective_rpc(
             "compile_or_warm_up_model"
         )
+        # [CN] 编译发生在 worker 进程内，主进程的 config 不会被更新，必须回传。
+        # [CN] 取 max 而非 sum：各 worker 并行编译，墙钟时间取决于最慢的那个。
         # Propagate compilation time from workers back to the main process.
         # With TP>1, compilation happens in worker processes, so the main
         # process config is never updated. Use max across workers since they
@@ -145,16 +174,20 @@ class Executor(ABC):
         """
         pass
 
+    # [CN] 显存画像：每个 worker 返回自己可用的 KV cache 字节数。
     def determine_available_memory(self) -> list[int]:  # in bytes
         return self.collective_rpc("determine_available_memory")
 
+    # [CN] 收集各 worker 的 KVCacheSpec，供调度器决定 block 大小与分组。
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         return self.collective_rpc("get_kv_cache_spec")
 
+    # [CN] 各后端支持的 KV cache 布局（NHD/HND 等），按偏好排序。
     def get_supported_kv_cache_layouts(self) -> list[list[str]]:
         """Layouts each worker's backends support, most preferred first."""
         return self.collective_rpc("get_supported_kv_cache_layouts")
 
+    # [CN] 把最终选定的布局广播给 worker，保证跨进程一致。
     def set_kv_cache_layout(self, layout_name: str) -> None:
         """Publish the resolved KV cache layout to the workers."""
         self.collective_rpc("set_kv_cache_layout", args=(layout_name,))
@@ -205,12 +238,14 @@ class Executor(ABC):
     ) -> Future[list[_R]]:
         pass
 
+    # [CN] 唯一的真抽象：所有广播最终都落到这里，由子类决定怎么送达。
     @abstractmethod
     def collective_rpc(
         self, method, timeout=None, args=(), kwargs=None, non_block: bool = False
     ):
         raise NotImplementedError
 
+    # [CN] KV connector 握手元数据（P/D 分离场景下 P 与 D 需要对齐的信息）。
     def get_kv_connector_handshake_metadata(
         self,
     ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:
@@ -228,6 +263,7 @@ class Executor(ABC):
     ) -> Future[ModelRunnerOutput | None]:
         pass
 
+    # [CN] 执行一步前向，取 driver worker（下标 0）的结果。
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
@@ -248,6 +284,7 @@ class Executor(ABC):
     ) -> Future[ModelRunnerOutput]:
         pass
 
+    # [CN] 仅做采样（前向已在上一步完成），配合 async scheduling 使用。
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
@@ -256,6 +293,7 @@ class Executor(ABC):
         )
         return output[0]
 
+    # [CN] 跑一个空批次：用于 DP 下的 wave 同步或保持 NCCL 通信活跃。
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")
 
@@ -287,6 +325,7 @@ class Executor(ABC):
         """Shutdown the executor."""
         self.collective_rpc("shutdown")
 
+    # [CN] KV connector 的输出在多 worker 间需要聚合（如 TP 下每个 rank 持有分片）。
     def init_kv_output_aggregator(self, connector: "KVConnectorBase") -> None:
         """Init KVOutputAggregator"""
         self.kv_output_aggregator = KVOutputAggregator.from_connector(
@@ -296,6 +335,7 @@ class Executor(ABC):
     def init_ec_output_aggregator(self) -> None:
         self.ec_output_aggregator = ECOutputAggregator()
 
+    # [CN] cached_property：避免每次查询都发一轮 RPC。
     @cached_property  # Avoid unnecessary RPC calls
     def supported_tasks(self) -> tuple[SupportedTask, ...]:
         output: list[tuple[SupportedTask, ...]]
@@ -308,6 +348,7 @@ class Executor(ABC):
         )
         return all(worker_support)
 
+    # [CN] LoRA 相关：要求所有 worker 都成功才算成功。
     def add_lora(self, lora_request: LoRARequest) -> bool:
         assert lora_request.lora_int_id > 0, "lora_id must be greater than 0."
         return all(self.collective_rpc("add_lora", args=(lora_request,)))
@@ -334,6 +375,7 @@ class Executor(ABC):
         """Reset the encoder cache in each worker to clear cached encoder outputs."""
         self.collective_rpc("reset_encoder_cache")
 
+    # [CN] 休眠：level 越大释放越多（1=仅 KV cache，2=连同权重一起卸载）。
     def sleep(self, level: int = 1):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")
@@ -347,6 +389,7 @@ class Executor(ABC):
             "It took %.6f seconds to fall asleep.", time_after_sleep - time_before_sleep
         )
 
+    # [CN] 唤醒：可按 tag 部分唤醒；只有全部 tag 都唤醒后才清除 is_sleeping。
     def wake_up(self, tags: list[str] | None = None):
         if not self.is_sleeping:
             logger.warning("Executor is not sleeping.")
@@ -379,6 +422,7 @@ class Executor(ABC):
     ) -> None:
         raise NotImplementedError
 
+    # [CN] 是否支持 async scheduling。多进程执行器会覆写为 True。
     @classmethod
     def supports_async_scheduling(cls) -> bool:
         """
@@ -387,6 +431,7 @@ class Executor(ABC):
         return False
 
 
+# [CN] 底部延迟导入：打破 abstract <-> uniproc 的循环引用，同时保留旧名字。
 from vllm.v1.executor.uniproc_executor import (  # noqa: E402
     ExecutorWithExternalLauncher as _ExecutorWithExternalLauncher,
 )

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# [CN] 文件总览：结构化输出（grammar / JSON schema）的 logits 掩码。
+# [CN] 做法：把「每请求每位置的允许 token 位图」拷到 GPU，
+# [CN] 再用 Triton kernel 把不允许的位置写成 -inf。
 import numpy as np
 import torch
 
@@ -10,6 +14,10 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+# [CN] 构造 bitmask 行号 -> logits 行号的映射。
+# [CN] 关键点：映射按「(请求, 位置)」编码而非绝对 logit 下标，
+# [CN] 因为自适应验证（adaptive verification）会在设备侧最终确定
+# [CN] 每请求的 logit 偏移，CPU 侧算出的绝对下标可能已失效。
 def _build_grammar_mapping(
     req_ids: list[str],
     grammar_req_ids: list[str],
@@ -36,6 +44,7 @@ def _build_grammar_mapping(
     return mapping
 
 
+# [CN] 持有两份持久 GPU 缓冲（下标映射与位图），避免每步重新分配。
 class StructuredOutputsWorker:
     def __init__(
         self,
@@ -56,6 +65,8 @@ class StructuredOutputsWorker:
         self.mask_stride = mask_stride
         self.num_bonus_tokens = num_bonus_tokens
 
+    # [CN] 掩码必须在采样前打上，因此这里虽然全程用拷贝流异步，
+    # [CN] 但在 launch kernel 之前必须 wait_stream 把拷贝等完。
     def apply_grammar_bitmask(
         self,
         logits: torch.Tensor,
@@ -115,6 +126,8 @@ class StructuredOutputsWorker:
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
+        # [CN] 反向的流同步：让拷贝流等 kernel 用完再复用/释放这些张量，
+        # [CN] 否则下一步的异步拷贝可能覆盖还在被 kernel 读的缓冲。
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
         self.copy_stream.wait_stream(current_stream)
@@ -123,6 +136,8 @@ class StructuredOutputsWorker:
 # Adapted from
 # https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
 @triton.jit
+# [CN] 改编自 xgrammar。每 (bitmask 行, vocab 分块) 一个 program。
+# [CN] 位图是 32 位打包的，先在 kernel 里解包成 bool 再写 -inf。
 def _apply_grammar_bitmask_kernel(
     logits_ptr,
     logits_stride,
